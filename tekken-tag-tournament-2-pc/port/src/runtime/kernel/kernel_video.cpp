@@ -1,0 +1,3987 @@
+// Xbox 360 video (Vd*) kernel layer: a "GPU heartbeat" that lets the game's own D3D runtime
+// run its swap/interrupt machinery before a real command processor exists.
+//
+// Contract reverse-engineered from TTT2's D3D runtime (PROJECT_STATUS session 5):
+// - The game registers interrupt callback 0x82738AD8 with context = D3D device pointer.
+//   source 0: callback reads GPU MMIO 0x7FC86544 (bit0 = swap pending) and runs the
+//   swap-complete DPC (flips via MMIO 0x7FC86110, signals the KEVENT at device+24460).
+//   source 1: dispatches the game's vblank callback + clears a per-CPU pending mask.
+// - Ring progress: the game polls the "GPU completed segment" counter at sysCmdBuf+0
+//   (sysCmdBuf = VdSetSystemCommandBufferGpuIdentifierAddress arg - 8) and the rptr
+//   writeback dword registered via VdEnableRingBufferRPtrWriteBack.
+// - Fences: PM4 EVENT_WRITE_SHD packets (header 0xC0025800: initiator, physAddr, value)
+//   expect the GPU to store `value` at `physAddr`. We scan the ring each tick and execute
+//   them, replacing the header with a PM4 NOP so they run once.
+#include "kernel_shared.h"
+#include "guest_heap.h"
+#include <intrin.h>
+#include "kernel_trace.h"
+#include "gpu_render.h"
+#include "phys_mirror.h"
+#include "gpu_ring_reader.h"
+#include "bounded_format.h"
+#include "timeline.h"
+#include "display_settings.h"
+#include "sys_ui.h"
+#include "log_utf8.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <map>
+#include <set>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+#include <process.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+void DiagNameThread(const wchar_t* name);   // kernel_thread.cpp (TEST ONLY)
+
+// Guest ISR/DPC chains can run deep; give guest-executing host threads big stacks
+// (a silent process death with no fault output = stack overflow in a detached thread).
+static void StartBigStackThread(unsigned (__stdcall* fn)(void*))
+{
+    uintptr_t h = _beginthreadex(nullptr, 8 * 1024 * 1024, fn, nullptr, 0, nullptr);
+    if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
+}
+
+static std::atomic<uint32_t> g_intrCallback{0};
+static std::atomic<uint32_t> g_intrContext{0};
+uint32_t VdDeviceGuest() { return g_intrContext.load(); }   // the D3D device (rollback.cpp keeps it out of its state)
+static std::atomic<uint32_t> g_ringBase{0};
+static std::atomic<uint32_t> g_ringSize{0};
+static std::atomic<uint32_t> g_rptrWriteBack{0};
+static std::atomic<uint32_t> g_sysCmdBuf{0};
+static std::atomic<bool> g_tickStarted{false};
+
+static constexpr uint32_t MMIO_SWAP_STATUS = 0x7FC86544u;   // reg 0x6544, bit0 = swap pending
+
+// GPU progress: bumped after every guest-memory write the GPU side makes - the command
+// processor's fences, memory writes and read-pointer writeback, and each guest interrupt
+// callback (the vblank / swap DPC tokens). Waiters on GPU-written values sleep on it
+// (WaitOnAddress) instead of spinning: guest_monitor.cpp's D3D wait, WaitRegMem below.
+std::atomic<uint32_t> g_gpuProgress{0};
+void GpuProgress()
+{
+    g_gpuProgress.fetch_add(1, std::memory_order_release);
+    WakeByAddressAll(&g_gpuProgress);
+}
+// Sleep until GpuProgress moves past `seen`, at most `ms` (true: it moved).
+bool WaitGpuProgress(uint32_t seen, DWORD ms)
+{
+    if (g_gpuProgress.load(std::memory_order_acquire) != seen) return true;
+    WaitOnAddress(&g_gpuProgress, &seen, sizeof(seen), ms);
+    return g_gpuProgress.load(std::memory_order_acquire) != seen;
+}
+
+// The D3D runtime hands the kernel PHYSICAL addresses (virtual & 0x1FFFFFFF). GPU-visible
+// allocations come from the physical heap at guest 0xA0000000+, so map them back.
+static uint32_t PhysToGuest(uint32_t addr)
+{
+    return (addr && addr < 0x20000000u) ? (addr | 0xA0000000u) : addr;
+}
+
+// ===================== Present pass: host window + frontbuffer blit =====================
+// The swap packet carries the frontbuffer TEXTURE FETCH BLOCK; we decode the surface
+// address from it and show the surface in a host window (and periodically dump a BMP
+// for headless verification). Even a black frame proves the flip chain end-to-end.
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "synchronization.lib")
+
+static std::atomic<uint32_t> g_frontBufferPhys{0};   // guest address of the displayed surface
+// The displayed surface's fetch-constant swizzle (12 bits). TTT2's is .zyx1 (0xA0A): it swaps
+// red and blue back after the final resolve's copy_dest_swap.
+static std::atomic<uint32_t> g_frontBufferSwizzle{ 0x688 };
+static bool SwizzleSwapsRB(uint32_t sw) { return (sw & 7) == 2 && ((sw >> 6) & 7) == 0; }
+static std::atomic<bool> g_presentStarted{false};
+static constexpr uint32_t FB_W = 1280, FB_H = 720;
+
+// Xbox 360 2D tiled-texture offset (32bpp texels). Standard XGAddress2DTiledOffset.
+static uint32_t TiledOffset32(uint32_t x, uint32_t y, uint32_t widthAligned)
+{
+    constexpr uint32_t logBpp = 2;   // 4 bytes/texel
+    uint32_t macro = ((x >> 5) + (y >> 5) * (widthAligned >> 5)) << (logBpp + 7);
+    uint32_t micro = (((x & 7) + ((y & 6) << 2)) << logBpp);
+    uint32_t offset = macro + ((micro & ~15u) << 1) + (micro & 15u) +
+                      ((y & 8) << (3 + logBpp)) + ((y & 1) << 4);
+    return (((offset & ~511u) << 3) + ((offset & 448u) << 2) + (offset & 63u) +
+            ((y & 16) << 7) + (((((y & 8) >> 2) + (x >> 3)) & 3u) << 6)) >> logBpp;
+}
+
+// Convert the guest surface (big-endian words, tiled unless TTT2_FB_LINEAR=1) into a
+// host BGRX staging buffer. The word's low byte is the fetched x component, so the image is
+// the ARGB reading of the word when the swizzle exchanges red and blue (TTT2's .zyx1).
+static void ConvertFrontBuffer(uint32_t fbGuest, uint32_t* out)
+{
+    static const bool linear = std::getenv("TTT2_FB_LINEAR") != nullptr;
+    const bool swapRB = !SwizzleSwapsRB(g_frontBufferSwizzle.load());
+    const uint8_t* src = g_base + fbGuest;
+    for (uint32_t y = 0; y < FB_H; ++y)
+    {
+        for (uint32_t x = 0; x < FB_W; ++x)
+        {
+            uint32_t idx = linear ? (y * FB_W + x) : TiledOffset32(x, y, FB_W);
+            uint32_t be;
+            std::memcpy(&be, src + idx * 4, 4);
+            uint32_t v = __builtin_bswap32(be);              // the guest word
+            if (swapRB) v = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+            out[y * FB_W + x] = v & 0x00FFFFFFu;             // BGRX for BI_RGB 32bpp
+        }
+    }
+}
+
+static void WriteBmpTo(const char* path, const uint32_t* px)
+{
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    uint32_t imgSize = FB_W * FB_H * 4;
+    uint8_t hdr[54] = {};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    *reinterpret_cast<uint32_t*>(hdr + 2) = 54 + imgSize;
+    *reinterpret_cast<uint32_t*>(hdr + 10) = 54;
+    *reinterpret_cast<uint32_t*>(hdr + 14) = 40;
+    *reinterpret_cast<int32_t*>(hdr + 18) = (int32_t)FB_W;
+    *reinterpret_cast<int32_t*>(hdr + 22) = -(int32_t)FB_H;   // top-down
+    *reinterpret_cast<uint16_t*>(hdr + 26) = 1;
+    *reinterpret_cast<uint16_t*>(hdr + 28) = 32;
+    *reinterpret_cast<uint32_t*>(hdr + 34) = imgSize;
+    std::fwrite(hdr, 1, sizeof(hdr), f);
+    std::fwrite(px, 1, imgSize, f);
+    std::fclose(f);
+}
+
+static void WriteFrontBufferBmp(const uint32_t* px)
+{
+    // TTT2_INSTANCE=<tag> gives a second instance its own file (fbdump<tag>.bmp, two-instance tests).
+    static const std::string path = [] {
+        const char* tag = std::getenv("TTT2_INSTANCE");
+        return std::string("C:/ttt2/port/fbdump") + (tag ? tag : "") + ".bmp";
+    }();
+    WriteBmpTo(path.c_str(), px);
+}
+
+// The mouse pointer over the game: the arrow in a window, none in borderless and fullscreen (the game
+// takes no mouse input; a pointer left over the picture covers it).
+static HCURSOR GameCursor()
+{
+    static const HCURSOR arrow = LoadCursorA(nullptr, reinterpret_cast<LPCSTR>(IDC_ARROW));
+    return display_settings::GetMode() == display_settings::Windowed ? arrow : nullptr;
+}
+
+// The game window. Closing it quits (as the main menu's EXIT does); Alt+Enter switches between
+// windowed and borderless (Options -> Display Settings -> DISPLAY MODE offers all three).
+static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && SysUiKeyCaptureActive())
+    {
+        // Controller Setup -> KEYBOARD waits for a key: every key goes there (Alt+Enter too), with
+        // left / right SHIFT, CTRL and ALT told apart (WM_KEYDOWN reports them generically).
+        if (lp & (1 << 30)) return 0;           // auto-repeat
+        int vk = static_cast<int>(wp);
+        const bool extended = (lp & (1 << 24)) != 0;
+        if (vk == VK_SHIFT) vk = static_cast<int>(MapVirtualKeyA((lp >> 16) & 0xFF, MAPVK_VSC_TO_VK_EX));
+        else if (vk == VK_CONTROL) vk = extended ? VK_RCONTROL : VK_LCONTROL;
+        else if (vk == VK_MENU) vk = extended ? VK_RMENU : VK_LMENU;
+        SysUiOnKey(vk);
+        return 0;
+    }
+    static const bool focusLog = [] { const char* e = std::getenv("TTT2_FOCUS_LOG"); return e && *e == '1'; }();
+    if (focusLog && (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE || msg == WM_KILLFOCUS || msg == WM_SETFOCUS || msg == WM_DISPLAYCHANGE))
+    {
+        // Diagnostics (TTT2_FOCUS_LOG=1): who takes the foreground when the game loses it.
+        DWORD pid = 0;
+        if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &pid);
+        wchar_t name[MAX_PATH] = L"?";   // printed as UTF-8 (log_utf8.h): -A gave '?' for a name outside the ANSI code page
+        if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+        {
+            DWORD n = MAX_PATH;
+            QueryFullProcessImageNameW(h, 0, name, &n);
+            CloseHandle(h);
+        }
+        std::string displays;
+        DISPLAY_DEVICEA dd{};
+        dd.cb = sizeof(dd);
+        for (DWORD i = 0; EnumDisplayDevicesA(nullptr, i, &dd, 0); ++i, dd.cb = sizeof(dd))
+        {
+            if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            DEVMODEA dm{};
+            dm.dmSize = sizeof(dm);
+            EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm);
+            char one[160];
+            std::snprintf(one, sizeof(one), " %s %lux%lu %lu Hz %lu bpp at %ld,%ld%s;", dd.DeviceName, dm.dmPelsWidth, dm.dmPelsHeight,
+                          dm.dmDisplayFrequency, dm.dmBitsPerPel, dm.dmPosition.x, dm.dmPosition.y,
+                          (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? " primary" : "");
+            displays += one;
+        }
+        std::fprintf(stderr, "[focus] %.1f ms: msg %04X wp %llX lp %llX; foreground pid %lu %s; displays:%s\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                     msg, (unsigned long long)wp, (unsigned long long)lp, pid,
+                     LogUtf8(std::wcsrchr(name, L'\\') ? std::wcsrchr(name, L'\\') + 1 : name).c_str(),
+                     displays.c_str());
+    }
+    switch (msg)
+    {
+    case WM_CLOSE:
+        std::fprintf(stderr, "[window] closed - quitting\n");
+        std::fflush(stderr);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
+        return 0;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN && (lp & (1 << 29)))
+        {
+            display_settings::SetMode(display_settings::GetMode() == display_settings::Windowed ? display_settings::Borderless
+                                                                                              : display_settings::Windowed);
+            return 0;
+        }
+        break;
+    case WM_SYSCHAR:
+        return 0;                               // no beep for Alt+Enter or Alt+letter (Alt can be a game key)
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(GameCursor()); return TRUE; }
+        break;
+    case WM_SYSCOMMAND:
+        // A lone Alt or F10 would put the window into menu mode (it has no menu): the next key
+        // then plays the error sound. Alt+F4 (SC_CLOSE) still closes.
+        if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
+        break;
+    case WM_CHAR:
+        // Typed text for the system UI's profile name entry (sys_ui.h); ignored otherwise.
+        if (SysUiTextEntryActive()) { SysUiOnChar(static_cast<uint32_t>(wp)); return 0; }
+        break;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE && SysUiTextEntryActive()) { SysUiOnChar(0x1B); return 0; }
+        break;
+    }
+    return DefWindowProcA(wnd, msg, wp, lp);
+}
+
+// Window style and size for the display mode: windowed = a framed window whose client area is the
+// chosen resolution (scaled down, keeping 16:9, when it does not fit the work area), centred;
+// borderless and fullscreen = a popup covering the monitor (the presenter makes fullscreen
+// exclusive at the chosen resolution).
+static void ApplyWindowMode(HWND wnd)
+{
+    const int mode = display_settings::GetMode();
+    const display_settings::Resolution r = display_settings::GetResolution();
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoA(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (mode == display_settings::Windowed)
+    {
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        SetWindowLongA(wnd, GWL_STYLE, LONG(style));
+        RECT frame{ 0, 0, 0, 0 };
+        AdjustWindowRect(&frame, style, FALSE);
+        const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+        const RECT& wa = mi.rcWork;
+        const int maxW = (wa.right - wa.left) - fw, maxH = (wa.bottom - wa.top) - fh;
+        int cw = int(r.width), ch = int(r.height);
+        if (cw > maxW || ch > maxH)
+        {
+            const double s = (std::min)(double(maxW) / cw, double(maxH) / ch);
+            cw = int(cw * s);
+            ch = int(ch * s);
+        }
+        const int w = cw + fw, h = ch + fh;
+        SetWindowPos(wnd, HWND_NOTOPMOST, wa.left + ((wa.right - wa.left) - w) / 2, wa.top + ((wa.bottom - wa.top) - h) / 2,
+                     w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    else
+    {
+        SetWindowLongA(wnd, GWL_STYLE, LONG(WS_POPUP | WS_VISIBLE));
+        const RECT& m = mi.rcMonitor;
+        SetWindowPos(wnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        // The presenter enters exclusive fullscreen only while the window is in front (and Windows only hides the
+        // taskbar for the window in front). A game started without the right to come to the front (the installer's
+        // "Play now?" goes through Explorer) and steered with a controller can stay behind for a whole session - the
+        // likely reason log 43 (2026-10-31) chose FULLSCREEN and never entered it. Windows refuses this too without
+        // that right (the taskbar button flashes instead).
+        if (GetForegroundWindow() != wnd)
+        {
+            const BOOL front = SetForegroundWindow(wnd);
+            std::fprintf(stderr, "[window] not in front: brought to the front %s\n", front ? "ok" : "refused by Windows");
+        }
+    }
+    std::fprintf(stderr, "[window] mode %d, resolution %ux%u\n", mode, r.width, r.height);
+}
+
+static unsigned __stdcall PresentThread(void*)
+{
+    DiagNameThread(L"present");
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc = GameWndProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "TTT2Recomp";
+    wc.hCursor = LoadCursorA(nullptr, reinterpret_cast<LPCSTR>(IDC_ARROW));
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));   // game.rc.in
+    RegisterClassA(&wc);
+    RECT rc = { 0, 0, (LONG)FB_W, (LONG)FB_H };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    int atX = CW_USEDEFAULT, atY = CW_USEDEFAULT;           // TTT2_WINDOW_AT=x,y (tests): start on another monitor
+    if (const char* e = std::getenv("TTT2_WINDOW_AT")) std::sscanf(e, "%d,%d", &atX, &atY);
+    HWND wnd = CreateWindowA("TTT2Recomp", "Tekken Tag Tournament 2 (recomp)",
+                             WS_OVERLAPPEDWINDOW | WS_VISIBLE, atX, atY,
+                             rc.right - rc.left, rc.bottom - rc.top,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!wnd) return 0;
+    GpuHwSetWindow(wnd);
+    if (GpuHwMode())
+    {
+        // The hardware backend presents through a DXGI swap chain from the CP thread at the
+        // game's own swap points (HwPresentFrame); this thread owns the window and applies the
+        // display mode (the saved one at start, then every change from the menu or Alt+Enter).
+        uint32_t applied = ~0u;
+        for (;;)
+        {
+            MSG msg;
+            while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageA(&msg);
+            }
+            const uint32_t generation = display_settings::Generation();
+            // Leaving exclusive fullscreen: the presenter switches back first, or DXGI would
+            // restore the window it saved over the new style. While exclusive fullscreen stays on
+            // (a new RESOLUTION), DXGI owns the window: the presenter changes the display mode and
+            // restyling or moving the window here would knock the swap chain out of it.
+            const bool exclusive = GpuHwIsExclusiveFullscreen();
+            const bool fullscreen = display_settings::GetMode() == display_settings::Fullscreen;
+            if (generation != applied && !(exclusive && !fullscreen))
+            {
+                if (!exclusive) ApplyWindowMode(wnd);
+                applied = generation;
+                // The pointer changes at once for the new mode, not at the next mouse move.
+                POINT at{};
+                if (GetCursorPos(&at) && WindowFromPoint(at) == wnd) SetCursor(GameCursor());
+            }
+            static const bool msgWait = [] { const char* e = std::getenv("TTT2_WINDOW_MSGWAIT"); return e && *e == '1'; }();
+            if (msgWait) MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    static uint32_t staging[FB_W * FB_H];
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = FB_W;
+    bmi.bmiHeader.biHeight = -(int32_t)FB_H;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    uint32_t frames = 0;
+    for (;;)
+    {
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        if (uint32_t fb = g_frontBufferPhys.load())
+        {
+            ConvertFrontBuffer(fb, staging);
+            HDC dc = GetDC(wnd);
+            StretchDIBits(dc, 0, 0, FB_W, FB_H, 0, 0, FB_W, FB_H,
+                          staging, &bmi, DIB_RGB_COLORS, SRCCOPY);
+            ReleaseDC(wnd, dc);
+            // TTT2_FBSEQ=<n>: also keep every n-th presented frame as its own numbered file, so a
+            // run produces a filmstrip. A single overwritten dump cannot tell a black screen
+            // from an animation caught mid-fade.
+            static const int seqEvery = [] {
+                const char* e = std::getenv("TTT2_FBSEQ");
+                return e ? (int)std::strtol(e, nullptr, 0) : 0;
+            }();
+            if (seqEvery > 0 && frames % seqEvery == 0)
+            {
+                CreateDirectoryA("C:/ttt2/port/fb", nullptr);
+                char fp[128];
+                BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/frame_%04u.bmp",
+                              frames / (uint32_t)seqEvery);
+                WriteBmpTo(fp, staging);
+            }
+            if (++frames % 60 == 1)
+            {
+                WriteFrontBufferBmp(staging);                       // headless verification
+                uint32_t nz = 0;
+                for (uint32_t i = 0; i < FB_W * FB_H; i += 97) nz += staging[i] != 0;
+                std::fprintf(stderr,
+                    "[vd] present fb=%08X raw[0]=%08X staging[0]=%08X staging[mid]=%08X nz=%u\n",
+                    fb, GRead32(g_base, fb), staging[0],
+                    staging[(FB_H / 2) * FB_W + FB_W / 2], nz);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+    }
+    return 0;
+}
+
+// Hardware-backend presentation at the game's swap point (CP thread, in stream order).
+// TTT2_FBSEQ / fbdump.bmp keep working: those frames are read back from the GPU.
+// Frames presented by the command processor / swaps issued by the game (diagnostics:
+// how far the CPU runs ahead of the GPU emulation).
+std::atomic<uint64_t> g_cpPresents{0}, g_gameSwaps{0};
+// Stages loaded so far (rollback.cpp's stage hook, game thread; gpu_hw_d3d11.h FollowStageLoad reads it).
+std::atomic<uint32_t> g_stageLoads{0};
+// Command batches (gpu_hw_d3d11.h DirtyTracker::SyncOnce): a new one with each newly published part of the ring and
+// at every point inside one where the CPU may act on the GPU's progress (fence and memory writes, waits, interrupts).
+std::atomic<uint32_t> g_cpSyncEpoch{1};
+double GpuDiagTscToQpc();                            // gpu_render.cpp (p_diag41)
+std::atomic<int64_t> g_diagDrawPacketTicks{0};      // DIAGNOSTIC BUILD: GpuExecuteDraw's wall time (gpu_hw_d3d11.h reports it)
+
+// ---- TEST ONLY (TTT2_DIAG_SPIKES=<max pictures>; off by default): which effect costs what. Every frame's command-
+// processor CPU time, the game's main thread CPU time, its draws (and how many took the CPU vertex path), the draw
+// packets' wall time and the present interval go to C:/ttt2/port/fb/frames<instance>.csv; a frame well above the median
+// of the last 240 (CP time 1.5x and +1 ms, draws 1.4x and +60, or a present interval over 25 ms while the median is
+// under 18) is logged as "[spike]" and its picture saved as fb/spike<instance>_NNNN.bmp (at most one per 30 frames).
+std::atomic<uint32_t> g_diagFrameDraws{0};
+// TEST ONLY (p_diag29): the frame's last draw - initiator, VS addr / size, PS addr / size, RB_SURFACE_INFO,
+// RB_COLOR_INFO, RB_DEPTH_INFO, RB_MODECONTROL, RB_COPY_CONTROL, RB_COPY_DEST_BASE - and the front buffer presented.
+static uint32_t g_diagLastDraw[11] = {};
+static uint32_t g_diagPresentFb = 0;
+void GpuHwDiagKeepFront();               // gpu_render.cpp (p_diag30)
+bool GpuHwDiagReadPrev(uint32_t* bgrx);  // gpu_render.cpp (p_diag30)
+std::atomic<int64_t> g_diagFramePacketTicks{0};
+extern std::atomic<uint32_t> g_diagFrameCpuDraws;   // gpu_render.cpp
+extern std::atomic<uint32_t> g_diagFrameCpuWhy[4];  // gpu_render.cpp
+extern std::atomic<uint32_t> g_diagFrameCpuVerts;   // gpu_render.cpp
+void GpuHwDiagFrameTotals(int64_t* ticks, int count, uint64_t* resolves);   // gpu_render.cpp
+void GpuHwDiagFirstUseTotals(uint32_t* vs, uint32_t* ps, uint32_t* states);  // gpu_render.cpp (p_diag27)
+extern HANDLE g_mainThreadHandle;                   // main.cpp
+static void DiagSpikeFrame(uint32_t frame)
+{
+    static const unsigned maxPictures = [] { const char* e = std::getenv("TTT2_DIAG_SPIKES"); return e ? unsigned(std::strtoul(e, nullptr, 0)) : 0u; }();
+    const uint32_t draws = g_diagFrameDraws.exchange(0, std::memory_order_relaxed);
+    const uint32_t cpuDraws = g_diagFrameCpuDraws.exchange(0, std::memory_order_relaxed);
+    const int64_t packetTicks = g_diagFramePacketTicks.exchange(0, std::memory_order_relaxed);
+    uint32_t why[4];
+    for (int i = 0; i < 4; ++i) why[i] = g_diagFrameCpuWhy[i].exchange(0, std::memory_order_relaxed);
+    const uint32_t cpuVerts = g_diagFrameCpuVerts.exchange(0, std::memory_order_relaxed);
+    if (!maxPictures) return;
+    static const double qpcPerMs = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return double(f.QuadPart) / 1000.0; }();
+    static const std::string tag = [] { const char* t = std::getenv("TTT2_INSTANCE"); return std::string(t ? t : ""); }();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    ULONG64 cp = 0, mainCycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cp);
+    if (g_mainThreadHandle) QueryThreadCycleTime(g_mainThreadHandle, &mainCycles);
+    const uint64_t tsc = __rdtsc();
+    static int64_t lastQpc = 0, calQpc = 0;
+    static uint64_t lastCp = 0, lastMain = 0, calTsc = 0;
+    static double tscPerMs = 0.0;
+    if (!calQpc) { calQpc = now.QuadPart; calTsc = tsc; }
+    else if (tscPerMs == 0.0 && now.QuadPart - calQpc > int64_t(qpcPerMs * 2000.0))
+        tscPerMs = double(tsc - calTsc) / (double(now.QuadPart - calQpc) / qpcPerMs);
+    const bool have = lastQpc && tscPerMs > 0.0;
+    const double cpMs = have ? double(cp - lastCp) / tscPerMs : 0.0, mainMs = have ? double(mainCycles - lastMain) / tscPerMs : 0.0;
+    const double intervalMs = lastQpc ? double(now.QuadPart - lastQpc) / qpcPerMs : 0.0, packetMs = double(packetTicks) / qpcPerMs;
+    lastQpc = now.QuadPart; lastCp = cp; lastMain = mainCycles;
+    // The renderer's parts (gpu_hw_d3d11.h DiagPart order); ReportDiag zeroes the totals every 5 s, so a total below
+    // the last one is a reset (that frame keeps only the part after it).
+    constexpr int Parts = 13;
+    static int64_t prevTicks[Parts] = {};
+    static uint64_t prevResolves = 0;
+    int64_t ticks[Parts] = {};
+    uint64_t resolves = 0;
+    GpuHwDiagFrameTotals(ticks, Parts, &resolves);
+    double partMs[Parts];
+    for (int i = 0; i < Parts; ++i)
+    {
+        partMs[i] = double(ticks[i] >= prevTicks[i] ? ticks[i] - prevTicks[i] : ticks[i]) / qpcPerMs;
+        prevTicks[i] = ticks[i];
+    }
+    const uint64_t frameResolves = resolves >= prevResolves ? resolves - prevResolves : resolves;
+    prevResolves = resolves;
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    const double unixMs = double(((uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000.0;
+    if (!have) return;
+    static FILE* csv = [] {
+        CreateDirectoryA("C:/ttt2/port/fb", nullptr);
+        FILE* f = std::fopen(("C:/ttt2/port/fb/frames" + tag + ".csv").c_str(), "w");
+        if (f) std::fputs("frame,unix_ms,cp_ms,main_ms,draws,cpu_draws,cpu_rect,cpu_novs,cpu_fallback,cpu_other,cpu_verts,resolves,"
+                          "packets_ms,interval_ms,cpuvert_ms,vdata_ms,index_ms,const_ms,tex_ms,upload_ms,shader_ms,state_ms,"
+                          "drawcall_ms,resolve_ms,present_ms,readback_ms,vssetup_ms,first_vs,first_ps,new_states,spike\n", f);
+        return f;
+    }();
+    constexpr size_t N = 240;
+    static double hCp[N], hDraws[N], hInterval[N];
+    static size_t filled = 0, at = 0;
+    auto median = [](const double* h) {
+        double v[N];
+        std::copy(h, h + N, v);
+        std::nth_element(v, v + N / 2, v + N);
+        return v[N / 2];
+    };
+    bool spike = false;
+    double mCp = 0, mDraws = 0, mInterval = 0;
+    static uint32_t ownCost = 0;                        // the frame after a screenshot or a spike picture
+    const bool measuredOnly = partMs[11] > 0.1 || (ownCost && frame == ownCost);
+    if (partMs[11] > 0.1) ownCost = frame + 1;
+    if (filled == N && frame > 600 && !measuredOnly)
+    {
+        mCp = median(hCp); mDraws = median(hDraws); mInterval = median(hInterval);
+        spike = (cpMs > mCp * 1.5 && cpMs > mCp + 1.0) || (draws > mDraws * 1.4 && draws > mDraws + 60.0) ||
+                (intervalMs > 25.0 && mInterval < 18.0);
+    }
+    hCp[at] = cpMs; hDraws[at] = double(draws); hInterval[at] = intervalMs;
+    at = (at + 1) % N;
+    filled = (std::min)(filled + 1, N);
+    if (csv)
+    {
+        std::fprintf(csv, "%u,%.1f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%llu,%.3f,%.3f", frame, unixMs, cpMs, mainMs, draws, cpuDraws, why[0], why[1],
+                     why[2], why[3], cpuVerts, (unsigned long long)frameResolves, packetMs, intervalMs);
+        for (int i = 0; i < Parts; ++i) std::fprintf(csv, ",%.3f", partMs[i]);
+        static uint32_t prevFirst[3] = {};
+        uint32_t first[3] = {};
+        GpuHwDiagFirstUseTotals(&first[0], &first[1], &first[2]);
+        std::fprintf(csv, ",%u,%u,%u", first[0] - prevFirst[0], first[1] - prevFirst[1], first[2] - prevFirst[2]);
+        std::memcpy(prevFirst, first, sizeof(first));
+        std::fprintf(csv, ",%d\n", spike ? 1 : 0);
+    }
+    {
+        // TEST ONLY (p_diag29): frames of one or two draws right after a full one - the picture shown, the next one.
+        static const unsigned oneDrawMax = [] { const char* e = std::getenv("TTT2_DIAG_ONEDRAW"); return e ? unsigned(std::strtoul(e, nullptr, 0)) : 0u; }();
+        static uint32_t prevDraws = 0, prevFb = 0;
+        static unsigned oneShots = 0;
+        static bool saveNext = false;
+        char nm[64] = "";
+        if (oneDrawMax && saveNext)
+        {
+            BoundedSnprintf(nm, sizeof(nm), "onedraw%s_%03u_b.bmp", tag.c_str(), oneShots - 1);
+            std::fprintf(stderr, "[onedraw] %.1f frame %u (the next): %u draws, %llu resolves, interval %.1f ms, front buffer %08X\n",
+                         unixMs, frame, draws, (unsigned long long)frameResolves, intervalMs, g_diagPresentFb);
+            saveNext = false;
+        }
+        else if (oneDrawMax && draws <= 2 && prevDraws > 50 && oneShots < oneDrawMax)
+        {
+            const uint32_t* L = g_diagLastDraw;
+            std::fprintf(stderr, "[onedraw] %.1f frame %u: %u draws after %u, %llu resolves, interval %.1f ms, front buffer %08X (before: %08X); "
+                                 "last draw: initiator %08X (prim %u, %u indices) vs %08X/%u ps %08X/%u surface %08X colour %08X depth %08X "
+                                 "mode %08X copy %08X dest %08X\n",
+                         unixMs, frame, draws, prevDraws, (unsigned long long)frameResolves, intervalMs, g_diagPresentFb, prevFb, L[0],
+                         L[0] & 0x3F, L[0] >> 16, L[1], L[2], L[3], L[4], L[5], L[6], L[7], L[8], L[9], L[10]);
+            BoundedSnprintf(nm, sizeof(nm), "onedraw%s_%03u_a.bmp", tag.c_str(), oneShots);
+            {
+                static std::vector<uint32_t> pp(FB_W * FB_H);     // p_diag30: the frame shown before it
+                if (GpuHwDiagReadPrev(pp.data()))
+                {
+                    char path[128];
+                    BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/fb/onedraw%s_%03u_p.bmp", tag.c_str(), oneShots);
+                    WriteBmpTo(path, pp.data());
+                }
+            }
+            ++oneShots;
+            saveNext = true;
+        }
+        prevDraws = draws;
+        prevFb = g_diagPresentFb;
+        if (*nm)
+        {
+            static std::vector<uint32_t> px(FB_W * FB_H);
+            if (GpuHwReadFrontBuffer(px.data()))
+            {
+                char path[128];
+                BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/fb/%s", nm);
+                WriteBmpTo(path, px.data());
+            }
+        }
+        if (oneDrawMax && oneShots < oneDrawMax) GpuHwDiagKeepFront();     // p_diag30
+    }
+    if (!spike) return;
+    static unsigned pictures = 0;
+    static uint32_t lastPicture = 0;
+    const bool picture = pictures < maxPictures && frame - lastPicture >= 30;
+    char name[64] = "";
+    if (picture) BoundedSnprintf(name, sizeof(name), "spike%s_%04u.bmp", tag.c_str(), pictures);
+    std::fprintf(stderr, "[spike] frame %u: cp %.2f ms (median %.2f), main %.2f ms, draws %u (median %.0f, cpu path %u), draw packets %.2f ms, "
+                         "present interval %.1f ms (median %.1f)%s%s\n",
+                 frame, cpMs, mCp, mainMs, draws, mDraws, cpuDraws, packetMs, intervalMs, mInterval, picture ? " -> " : "", name);
+    if (!picture) return;
+    static std::vector<uint32_t> staging(FB_W * FB_H);
+    if (GpuHwReadFrontBuffer(staging.data()))
+    {
+        char path[128];
+        BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/fb/%s", name);
+        WriteBmpTo(path, staging.data());
+    }
+    ++pictures;
+    lastPicture = frame;
+    ownCost = frame + 1;
+}
+
+// DIAGNOSTIC BUILD (0.1.7-diag1): a frame that takes over 400 ms (after the first 3000 frames: past the boot) gets
+// every thread's stack dumped (main.cpp DumpAllStacks; resolve with this build's linker map), at most 12 times, and
+// how long the gap lasted. The character select / VS screen freezes of a low-end PC report (0.5-1.8 s).
+// TEST 13: from 80 ms on as well (log 41: 111-121 ms frames on stage 14, where the renderer and the frame kick took
+// ~6 ms of them - the time is spent elsewhere, so the stacks say where; a developer reading the player's logs asked
+// for it). Those short ones at most 36 times, 2 s apart; a gap still going at 400 ms gets its own dump. Checked every
+// 10 ms, so a 110 ms frame is caught with ~30 ms left of it.
+void DumpAllStacks(const char* why);
+void GpuDiagFirstUses(double seconds, int& ps, int& vs);   // gpu_render.cpp (DIAGNOSTIC BUILD)
+static void PresentGapWatch()
+{
+    DiagNameThread(L"gap-watch");
+    using clock = std::chrono::steady_clock;
+    uint64_t last = g_cpPresents.load();
+    auto at = clock::now(), lastShortDump = at - std::chrono::seconds(10);
+    int shortDumps = 0, longDumps = 0;
+    bool dumpedShort = false, dumpedLong = false;
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const uint64_t now = g_cpPresents.load();
+        const auto t = clock::now();
+        const long long gap = std::chrono::duration_cast<std::chrono::milliseconds>(t - at).count();
+        if (now != last)
+        {
+            if (dumpedShort || dumpedLong)
+                std::fprintf(stderr, "[diag] the frame gap at frame %llu lasted %lld ms\n", (unsigned long long)last, gap);
+            last = now; at = t; dumpedShort = dumpedLong = false;
+            continue;
+        }
+        if (last < 3000 || gap < 80) continue;
+        const bool longGap = gap >= 400;
+        if (longGap ? (dumpedLong || longDumps >= 12)
+                    : (dumpedShort || shortDumps >= 36 || t - lastShortDump < std::chrono::seconds(2)))
+            continue;
+        if (longGap) { dumpedLong = true; ++longDumps; }
+        else { dumpedShort = true; ++shortDumps; lastShortDump = t; }
+        int ps = 0, vs = 0;
+        GpuDiagFirstUses(1.5, ps, vs);
+        std::fprintf(stderr, "[diag] no frame for %lld ms after frame %llu (shaders first bound in the 1.5 s before: %d pixel, %d vertex) - "
+                             "every thread's stack:\n", gap, (unsigned long long)last, ps, vs);
+        DumpAllStacks(longGap ? "no frame for 400 ms" : "no frame for 80 ms");
+    }
+}
+
+// Frame pacing diagnostics (TTT2_FRAMETIME=1): intervals between the game's VdSwap calls
+// (guest CPU frame) and between the command processor's presents (GPU emulation + D3D11),
+// a 10 s summary per stream (frames, intervals over 17.5/25/33/50 ms, longest) and one line
+// per interval over 25 ms. Each timer is used by one thread only.
+void HitchRegisterThread(const char* name);   // diag_hooks.cpp (TTT2_HITCH_PROFILE=3)
+void HitchFrameGap(double ms);
+static bool FrameTimeLog()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+    return on;
+}
+struct FrameTimer
+{
+    const char* name;
+    std::chrono::steady_clock::time_point last{}, window{};
+    uint64_t frames = 0, over17 = 0, over25 = 0, over33 = 0, over50 = 0;
+    double longest = 0;
+    void Mark(double workMs = -1)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (last.time_since_epoch().count())
+        {
+            const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+            ++frames;
+            over17 += ms > 17.5, over25 += ms > 25, over33 += ms > 33.4, over50 += ms > 50;
+            longest = (std::max)(longest, ms);
+            if (ms > 25 && name[0] == 'p') HitchFrameGap(ms);
+            if (ms > 25)
+                std::fprintf(stderr, "[frame] %s gap %.1f ms (swaps %llu presents %llu, present call %.1f ms)\n", name, ms,
+                             (unsigned long long)g_gameSwaps.load(), (unsigned long long)g_cpPresents.load(),
+                             workMs >= 0 ? workMs : 0.0);
+        }
+        else window = now;
+        last = now;
+        if (now - window >= std::chrono::seconds(10))
+        {
+            std::fprintf(stderr, "[frame] %s 10s: %llu frames, >17.5ms %llu, >25ms %llu, >33ms %llu, >50ms %llu, longest %.1f ms\n",
+                         name, (unsigned long long)frames, (unsigned long long)over17, (unsigned long long)over25,
+                         (unsigned long long)over33, (unsigned long long)over50, longest);
+            frames = over17 = over25 = over33 = over50 = 0;
+            longest = 0;
+            window = now;
+        }
+    }
+};
+
+// ---- Display gamma LUT. The console applies a 256-entry table (DC_LUT_30_COLOR words: blue
+// bits 0-9, green 10-19, red 20-29) to the front buffer at scan-out. D3D loads it from the
+// display type VdGetCurrentDisplayGamma reports: for 2 (HDTV, also Xenia's default) TTT2 writes
+// BT709_OETF(sRGB_EOTF(x)) - MEASURED 2026-10-12: entry 128 = 462/1023 (formula 0.4504), entry
+// 16 = 24/1023 (formula 0.0234). Register semantics follow Xenia's
+// CommandProcessor::WriteRegister (tools/ref_xenia/command_processor.cc). The present applies the
+// table (gpu_hw_d3d11.h Present; TTT2_GAMMA_RAMP=0 shows the unramped frame buffer).
+static std::mutex g_gammaMutex;
+static std::atomic<uint32_t> g_gammaVersion{ 0 };
+static uint32_t g_gammaComponent = 0;                 // DC_LUT_SEQ_COLOR: red, green, blue
+static uint32_t* GammaRamp()
+{
+    static uint32_t ramp[256] = {};
+    static const bool init = [] {
+        for (uint32_t i = 0; i < 256; ++i) { const uint32_t v = i * 0x3FF / 0xFF; ramp[i] = v | (v << 10) | (v << 20); }
+        return true;
+    }();
+    (void)init;
+    return ramp;
+}
+static void GammaRegisterWritten(uint32_t reg, uint32_t value);
+
+// TTT2_INPUT_TIMING=1: input latency tests log every game swap and present (same clock as the
+// [input] / [burst] lines).
+static bool InputTimingOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_INPUT_TIMING"); return e && *e == '1'; }();
+    return on;
+}
+
+static bool EarlyPresentOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_EARLY_PRESENT"); return !(e && *e == '0'); }();
+    return on;
+}
+// Early present: VdSwap numbers the swaps it writes a marker for and records each one's front
+// buffer; the CP counts the markers it executes, so the frame a vblank-token wait belongs to is
+// known (see the WAIT_REG_MEM packet).
+std::atomic<uint32_t> g_markerSwaps{ 0 };               // markers written (VdSwap, main thread)
+std::atomic<uint32_t> g_markerFb[16];                   // their front buffer surfaces, by number
+static uint32_t g_cpMarkers = 0;                        // markers executed (CP thread)
+// Rollback (rollback.cpp): frames re-simulated in one host frame still run the game's draw, so its
+// job and render pipeline keeps its rhythm, but the command processor discards their work: no draws,
+// no resolves, memory waits (the vblank token) satisfied at once, nothing presented. Frames by
+// marker number, [from, to).
+static std::atomic<uint32_t> g_discardFrom{ 0 }, g_discardTo{ 0 };
+uint32_t GpuCpMarkers() { return g_cpMarkers; }   // rollback.cpp diagnostics (racy read)
+void GpuDiscardNextFrames(uint32_t n)
+{
+    const uint32_t from = g_markerSwaps.load() + 1;
+    g_discardTo.store(from + n);
+    g_discardFrom.store(from);
+}
+// The re-simulation is over: the window ends after the frames written so far (fewer than asked when a
+// re-simulation stopped early), so the next frame is shown.
+void GpuDiscardEndNow() { g_discardTo.store(g_markerSwaps.load() + 1); }
+static bool CpDiscarding()                               // CP thread: the frame it is executing
+{
+    const uint32_t frame = g_cpMarkers + 1;
+    return frame >= g_discardFrom.load(std::memory_order_relaxed) && frame < g_discardTo.load(std::memory_order_relaxed);
+}
+// Before a rewind: frames already handed to the GPU finish now, without waiting for the vblank
+// (their memory waits pass at once; early present has shown them already). A restore rewinds the
+// D3D runtime's dynamic-buffer bookkeeping, and a frame still in flight would read buffers the
+// re-simulated frames then reuse (MEASURED: fighters drawn with garbage vertices).
+static std::atomic<uint32_t> g_noPacingThrough{ 0 };
+static bool CpUnpaced() { return g_cpMarkers + 1 <= g_noPacingThrough.load(std::memory_order_relaxed); }
+
+// D3D's vblank fence (sub_82740EF0, MEASURED): each frame's swap sets SCRATCH_REG1 = 1, queues a
+// flip-queue entry through the swap interrupt (sub_82740610: due = the previous entry's vblank + the
+// interval, at the earliest now) and waits until the vblank DPC (sub_827404E0) retires it, which sets
+// SCRATCH_REG1 = 0. Discarded and unpaced frames skip that wait, so their entries stayed queued: every
+// later frame's vblank moved out by one per rewound frame, and the stale entries retired later, one
+// per vblank - one cleared SCRATCH_REG1 right after a live frame set it, and that frame's "== 1" wait
+// never passed (MEASURED: [pm4-fault] after ~300 rewinds of 7 frames). Their swaps now complete at
+// once, and the vblank schedule stays the live frames'.
+static constexpr uint32_t kFlipLock = 17120, kFlipHead = 17108, kFlipTail = 17112, kFlipQueue = 16980,
+                          kVblanks = 16952, kLastDue = 16960, kFlips = 16976, kScratchShadow = 11028;
+// Late frames flip at once (TTT2_LATE_FLIP=0: as the game asks). The swap interrupt flips a frame that missed its
+// vblank at once only while the swap comes within the game's threshold (the argument's low byte, a percentage of the
+// vblank period); later than that it waits for the next vblank - on the console, so that a late frame never tears.
+// MEASURED 2026-10-28 (timeline, command processor ~17.5 ms a frame): every late frame then waited ~15.5 ms for the
+// next vblank, and frames ran at exactly 30 fps, overlapped or in turn. Here the picture is presented when that wait
+// starts (early present) and the display keeps its own sync, so flipping the late frame at once tears nothing; the
+// game keeps its own 60 Hz pace (its vblank ticker), as the no-pacing test of 2026-10-20 showed.
+static bool LateFlipEnv()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_LATE_FLIP"); return !(e && *e == '0'); }();
+    return on;
+}
+// DIAGNOSTIC BUILD A/B (diag10's; TTT2_DIAG_LATEFLIP_AB=1 on): report windows alternate between late frames flipped at
+// once and late frames waiting for the next vblank (the game's way), so a player's log compares both on the player's PC
+// (gpu_hw_d3d11.h AbSwitch; the window's way is in the report). Player logs 24/25: flipped at once was faster on all
+// five stages played (Tulip Festival 47.9 -> 52.7 fps), so since diag11 it is always on.
+static std::atomic<bool> g_lateFlipWaits{ false };
+bool GpuLateFlipAbOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_DIAG_LATEFLIP_AB"); return e && *e == '1' && LateFlipEnv(); }();
+    return on;
+}
+void GpuLateFlipAbToggle()
+{
+    if (GpuLateFlipAbOn()) g_lateFlipWaits.store(!g_lateFlipWaits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+bool LateFlipOn() { return LateFlipEnv() && !g_lateFlipWaits.load(std::memory_order_relaxed); }
+// The frame kick's swap whose game moves on at once (diag_hooks.cpp, sub_82AD4D98: the kick's wait for the vblank after
+// the swap has passed already) flips at once too (TTT2_PACE_FLIP=0: as the game asks). Its entry would be due at the
+// next vblank, and only the next frame's fence would wait for it: the command processor holds the next list behind the
+// swap until that vblank, the kick's fence waits for it, the next entry is due a vblank later again, and so on. MEASURED
+// 2026-11-01 (Fallen Garden, after the stage's load): 300 entries a 5-s window, none late, the frame kick waiting
+// 14.9 ms a frame for the command processor, every picture a frame later; the low-latency AUTO never turned on. A frame
+// whose game waits for the next vblank keeps the game's schedule.
+// TEST 18: only for frames LOW LATENCY draws before their swap, and for a settled late schedule on a PC with lots of room
+// (low_latency.cpp, LowLatencyPaceFlip). Otherwise a frame that came too soon after the last one waits for its vblank as
+// the game asks, which is also how a PC at its limit gets its slack back: that wait lines the game thread up with the
+// vblank again. The tester's i3-3240 + GT 730 (logs 54 / 55, one session each, same evening, same stages, OFF): TEST 15
+// 60 fps with 18 late entries a 5-s window, TEST 17 58 fps with 144 and this path taken 3 times a window. On the dev PC
+// under load it made no measurable difference, so whether it was the cause there is open; it was the one change to frame
+// timing since TEST 15 still on with OFF. TTT2_PACE_FLIP=0 never, =1 always (tests).
+bool LowLatencyPaceFlip(bool atOnce);                   // low_latency.cpp
+static bool PaceFlipOn(bool atOnce)
+{
+    static const int forced = [] { const char* e = std::getenv("TTT2_PACE_FLIP"); return !e || !*e ? -1 : *e == '0' ? 0 : 1; }();
+    return forced >= 0 ? atOnce && forced == 1 : LowLatencyPaceFlip(atOnce);
+}
+static std::atomic<bool> g_kickFlipAtOnce{ false };
+void GpuKickSwapFlipAtOnce(bool atOnce) { g_kickFlipAtOnce.store(PaceFlipOn(atOnce), std::memory_order_release); }
+static std::atomic<uint64_t> g_flipCalls{ 0 }, g_lateFlips{ 0 }, g_paceFlips{ 0 };
+// The 5-s report (gpu_hw_d3d11.h): flip-queue entries, those queued after their vblank had passed, and those made due
+// at once for the game's pace.
+void GpuTakeFlipStats(uint64_t& entries, uint64_t& late, uint64_t& paced)
+{
+    entries = g_flipCalls.exchange(0, std::memory_order_relaxed);
+    late = g_lateFlips.exchange(0, std::memory_order_relaxed);
+    paced = g_paceFlips.exchange(0, std::memory_order_relaxed);
+}
+
+extern "C" PPC_FUNC(__imp__sub_82740610);
+PPC_FUNC(sub_82740610)
+{
+    const uint32_t dev = g_intrContext.load();
+    const bool kickAtOnce = g_kickFlipAtOnce.exchange(false, std::memory_order_acq_rel);   // this swap's (no other comes between)
+    if (!dev || !(CpDiscarding() || CpUnpaced()))
+    {
+        if (dev)
+        {
+            g_flipCalls.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t arg = ctx.r3.u32 & 0xFFF;
+            // Read without the queue's lock: for the report, and the ISR takes the later of the due vblank and now.
+            const uint32_t interval = (arg >> 8) & 0xF, vblanks = GRead32(base, dev + kVblanks);
+            if (GRead32(base, dev + kLastDue) + interval <= vblanks)
+                g_lateFlips.fetch_add(1, std::memory_order_relaxed);
+            else if (kickAtOnce)
+            {
+                g_paceFlips.fetch_add(1, std::memory_order_relaxed);
+                GWrite32(base, dev + kLastDue, vblanks - interval);   // due now; with the threshold below, flipped now
+                ctx.r3.u32 |= 0xFF;
+            }
+            // TEST ONLY (TTT2_DIAG_PHASE_A=<s>): <s> seconds into the first fight (battle state 21), one entry is made due
+            // two vblanks on, so the next frame's fence waits a vblank out as after a load in the game's order, to see the
+            // frame kick get out (LOW LATENCY drawing early, or 2 s later with room to spare; else stay) of every later entry being due a vblank later.
+            static const int phaseA = [] { const char* e = std::getenv("TTT2_DIAG_PHASE_A"); return e ? std::atoi(e) : 0; }();
+            static int64_t fightSince = 0;
+            if (phaseA > 0 && fightSince >= 0)
+            {
+                const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (GRead32(base, 0x82EAC03Cu) != 21) {}
+                else if (!fightSince) fightSince = nowMs;
+                else if (nowMs - fightSince >= phaseA * 1000)
+                {
+                    fightSince = -1;
+                    GWrite32(base, dev + kLastDue, vblanks + 1);
+                    std::fprintf(stderr, "[video] TEST this flip-queue entry is due a vblank later (phase A)\n");
+                }
+            }
+            static uint32_t lastArg = ~0u;
+            static int argLogs = 0;
+            if (arg != lastArg && argLogs < 8)
+            {
+                ++argLogs;
+                std::fprintf(stderr, "[video] flip-queue entry: interval %u, late-flip threshold %u%% (late frames flip at once: %s)\n",
+                             (arg >> 8) & 0xF, arg & 0xFF, GpuLateFlipAbOn() ? "a/b" : LateFlipEnv() ? "on" : "off");
+            }
+            lastArg = arg;
+        }
+        if (LateFlipOn()) ctx.r3.u32 |= 0xFF;   // no percentage above it: a late frame always flips at once
+        __imp__sub_82740610(ctx, base);
+        return;
+    }
+    // Due now: the previous entry's vblank one interval before the current one (the ISR takes the
+    // later of that + the interval and now, under its lock) and no "too late in this vblank" bump
+    // (its threshold, the argument's low byte, above any percentage). Then the live schedule back.
+    const uint32_t lastDue = GRead32(base, dev + kLastDue);
+    GWrite32(base, dev + kLastDue, GRead32(base, dev + kVblanks) - ((ctx.r3.u32 >> 8) & 0xF));
+    ctx.r3.u32 |= 0xFF;
+    __imp__sub_82740610(ctx, base);
+    GWrite32(base, dev + kLastDue, lastDue);
+}
+
+// TEST 17: the XMV movie player's RenderNextFrame (sub_8277EDA8; the game's movie object sub_825AA740 calls it on the
+// main thread, every other frame for the menus' movies: modes 5, 16 and 21, none in fights) renders the next frame
+// once it is due within 38 ms on the player's clock (QPC milliseconds times the playback rate, sub_82774A18) - else it
+// holds it for the next call - and then sleeps until 5 ms before it is due (Sleep at 8277F7DC). Two of our vblanks are
+// 33.334 ms (VideoTick, 60.00 Hz) and a 29.97 fps movie frame is 33.367 ms, so each call comes 33 us earlier and the
+// sleep grows ~1 ms a second before it starts over; on the 360's 59.94 Hz two vblanks are one movie frame and the wait
+// stays put. MEASURED 2026-11-02 (tester logs 46-50; dev ui17_a, nusH, cust_f2): the main thread's sleeping grows
+// 0.77-1.04 ms a second (log 50: 2.7 -> 20.9 ms over 19 s of one menu stay), eats the frame's vblank slack (waiting
+// 10.0 -> 0.6 ms a frame) and makes 22-31 ms frames paired with 2-13 ms ones at 60 presents a second, the same with
+// LOW LATENCY AUTO, ON and OFF (TEST 15 too). On the title screen (mode 5) the same sleep is 15-28 ms from its first
+// frames with no ramp (cause unknown; 31 + 2 ms frame pairs). A screen below 60 fps never sleeps here (the calls come
+// more than a movie frame apart: the i3's Customize, log 48). The frame is rendered before the sleep and every game
+// frame waits for its vblank anyway, so this one sleep is skipped on the game's main thread: a movie frame shows up to
+// 38 ms early and one is held about every 34 s, as on any 60 Hz display of 29.97 fps video (inferred). MEASURED
+// (dev, 80 s each, TTT2_MOVIE_SLEEP=1 vs the skip): main menu 2143 -> 9 slow frames, title 696 -> 14, Customize
+// 822 -> 30, 60 presents a second and the music at 100% either way; the gallery's opening movie plays at 60 with the
+// main thread 0.4 ms a frame on the processor. Other threads keep it. TTT2_MOVIE_SLEEP=1: the game's sleep as before.
+static bool MovieSleepEnv()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_MOVIE_SLEEP"); return e && *e == '1'; }();
+    return on;
+}
+static bool OnGameMainThread()
+{
+    thread_local int is = -1;
+    if (is < 0)
+    {
+        if (!g_mainThreadHandle) return false;
+        is = GetThreadId(g_mainThreadHandle) == GetCurrentThreadId() ? 1 : 0;
+    }
+    return is == 1;
+}
+extern "C" PPC_FUNC(__imp__sub_82BEEF78);
+PPC_FUNC(sub_82BEEF78)
+{
+    if (uint32_t(ctx.lr) == 0x8277F7E0u && !MovieSleepEnv() && OnGameMainThread())
+    {
+        static std::atomic<bool> logged{ false };
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[video] movie player: its sleep until a frame is due is skipped (%u ms asked; TTT2_MOVIE_SLEEP=1 keeps it)\n", ctx.r3.u32);
+        ctx.r3.u64 = 0;   // what SleepEx(ms, FALSE) returns when not alerted
+        return;
+    }
+    __imp__sub_82BEEF78(ctx, base);
+}
+
+// After the drain: a frame that queued its entry before the drain started and then skipped its wait
+// left the entry behind. Retire what is queued now, as the DPC would, under the queue's lock.
+static void RetireQueuedFlips()
+{
+    const uint32_t dev = g_intrContext.load();
+    if (!dev) return;
+    volatile long* lock = reinterpret_cast<volatile long*>(g_base + dev + kFlipLock);
+    while (_InterlockedCompareExchange(lock, 1, 0) != 0) _mm_pause();
+    const uint32_t tail = GRead32(g_base, dev + kFlipTail), shadow = GRead32(g_base, dev + kScratchShadow);
+    uint32_t head = GRead32(g_base, dev + kFlipHead);
+    for (; head != tail; ++head)
+    {
+        const uint32_t fb = GRead32(g_base, dev + kFlipQueue + (head & 15) * 8);
+        GWrite32(g_base, dev + kFlips, GRead32(g_base, dev + kFlips) + 1);
+        if (fb) GWrite32(g_base, 0x7FC86110u, fb);
+        else if (shadow) GWrite32(g_base, shadow + 4, 0);
+    }
+    GWrite32(g_base, dev + kFlipHead, head);
+    const uint32_t now = GRead32(g_base, dev + kVblanks);
+    if (int32_t(GRead32(g_base, dev + kLastDue) - now) > 0) GWrite32(g_base, dev + kLastDue, now);   // next swap: next vblank
+    _InterlockedExchange(lock, 0);
+}
+
+bool GpuRingDrained();
+uint32_t GpuRingPendingBytes();
+// A rewind that does not wait (rollback.cpp, its re-simulation's skinned vertices in scratch memory):
+// the frames already handed over run without their vblank waits, as for GpuFinishInFlight, so the
+// command buffers they hold free up for the re-simulation's draws at once.
+// And the flip queue is retired right after the last of those frames (RetireQueuedFlips), as the
+// drain does once they are done: by the command processor when it executes that frame's marker
+// (CpRetireAfterUnpaced), or here when it is done already - whichever claims g_retireAt first.
+static std::atomic<uint32_t> g_retireAt{ 0 };     // marker after which the flip queue is retired (0 none)
+static void CpRetireAfterUnpaced()                 // CP thread, after each marker
+{
+    std::atomic_thread_fence(std::memory_order_seq_cst);   // the marker count before the claim (vs GpuUnpaceInFlight)
+    const uint32_t at = g_retireAt.load(std::memory_order_seq_cst);
+    if (at && g_cpMarkers >= at && g_retireAt.exchange(0) != 0) RetireQueuedFlips();
+}
+void GpuUnpaceInFlight()
+{
+    const uint32_t through = g_markerSwaps.load();
+    g_noPacingThrough.store(through);
+    g_retireAt.store(through ? through : 1, std::memory_order_seq_cst);
+    WakeByAddressAll(&g_gpuProgress);
+    if (g_cpMarkers >= through && g_retireAt.exchange(0) != 0) RetireQueuedFlips();
+}
+// `discardInFlight`: the frames already handed over but not executed yet are dropped instead of drawn -
+// the command processor still walks their packets (fences, markers, waits), fast, but executes no draws,
+// resolves or presents (as for re-simulated frames); the screen keeps the last presented frame until
+// the corrected one. rollback.cpp decides (RewindDropsInFlight).
+bool GpuFinishInFlight(int maxMs, bool discardInFlight)
+{
+    const timeline::Scope drainMark{ timeline::RbDrain };
+    if (discardInFlight)
+    {
+        const uint32_t from = g_cpMarkers + 1, to = g_markerSwaps.load() + 1;
+        if (to > from)
+        {
+            g_discardTo.store(to);
+            g_discardFrom.store(from);
+        }
+    }
+    g_noPacingThrough.store(g_markerSwaps.load());
+    WakeByAddressAll(&g_gpuProgress);
+    const auto start = std::chrono::steady_clock::now();
+    const uint32_t pendingAtStart = GpuRingPendingBytes();
+    const uint32_t markersAtStart = g_cpMarkers, swapsAtStart = g_markerSwaps.load();
+    uint32_t sleeps = 0, wokeByProgress = 0;
+    bool drained = true;
+    while (!GpuRingDrained())
+    {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(maxMs)) { drained = false; break; }
+        ++sleeps;
+        if (WaitGpuProgress(g_gpuProgress.load(std::memory_order_acquire), 1)) ++wokeByProgress;
+    }
+    static int traced = 0;
+    if (traced++ < 40)
+        std::fprintf(stderr, "[drain] %.2f ms: %u ring bytes pending, CP markers %u of %u swaps, %u sleeps (%u woken by progress)\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), pendingAtStart,
+                     markersAtStart, swapsAtStart, sleeps, wokeByProgress);
+    RetireQueuedFlips();
+    GpuProgress();
+    return drained;
+}
+static uint32_t g_earlySwap = 0;                        // the marker number presented early (CP)
+static bool g_earlyBroken = false;                      // a marker did not match: early present off
+// The game's swap: wait for the vblank token (the previous flip done), resolve the frame from EDRAM
+// into the front buffer, marker. Early present does that resolve itself when the wait starts, with
+// the arguments of the previous frame's front resolve; the game's own repeats it after the wait.
+struct FrontResolveArgs
+{
+    uint32_t key = 0, dest = 0, pitch = 0, height = 0, latch = 0, src = 0, depthBase = 0, format = 0;
+    bool hasLatch = false, swap = false, depthFloat = false;
+    bool operator==(const FrontResolveArgs& o) const
+    {
+        return key == o.key && dest == o.dest && pitch == o.pitch && height == o.height && latch == o.latch && src == o.src &&
+               depthBase == o.depthBase && format == o.format && hasLatch == o.hasLatch && swap == o.swap && depthFloat == o.depthFloat;
+    }
+};
+static FrontResolveArgs g_frontArgs, g_earlyArgs;       // CP: the last front resolve / the early one
+static uint32_t g_frontArgsAt = ~0u;                    // markers executed when the last one ran
+static bool g_earlyMismatch = false;                    // this frame's own differed: present at its marker
+
+static void HwPresentFrame(uint32_t fb)
+{
+    const timeline::Scope presentMark{ timeline::CpPresent, fb };
+    g_cpPresents.fetch_add(1, std::memory_order_relaxed);
+    static const bool gapWatch = [] { std::thread(PresentGapWatch).detach(); return true; }();
+    (void)gapWatch;
+    const auto presentStart = std::chrono::steady_clock::now();
+    if (InputTimingOn())
+        std::fprintf(stderr, "[present] #%u at %.1f ms\n", g_cpPresents.load(),
+                     std::chrono::duration<double, std::milli>(presentStart.time_since_epoch()).count());
+    static uint32_t ramp[256], rampVersion = ~0u;
+    if (const uint32_t v = g_gammaVersion.load(); v != rampVersion)
+    {
+        std::lock_guard<std::mutex> lock(g_gammaMutex);
+        std::memcpy(ramp, GammaRamp(), sizeof(ramp));
+        rampVersion = v;
+    }
+    if (!fb || !GpuHwPresent(fb, SwizzleSwapsRB(g_frontBufferSwizzle.load()), ramp, rampVersion)) return;
+    if (FrameTimeLog())
+    {
+        static FrameTimer presents{ "present" };
+        presents.Mark(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count());
+    }
+    static uint32_t frames = 0;
+    static const int seqEvery = [] {
+        const char* e = std::getenv("TTT2_FBSEQ");
+        return e ? (int)std::strtol(e, nullptr, 0) : 0;
+    }();
+    // A burst on request (TTT2_FBDUMP=request): fbdump.request holding "seq <count> <every>" writes
+    // <count> frames, one every <every> presents, as port/fb/burst_NNNN.bmp (a short scene such as a
+    // fight intro, without TTT2_FBSEQ dumping the whole run).
+    static uint32_t burstLeft = 0, burstEvery = 1, burstIndex = 0;
+    const bool burst = burstLeft && frames % burstEvery == 0;
+    const bool seq = (seqEvery > 0 && frames % (uint32_t)seqEvery == 0) || burst;
+    // fbdump.bmp every 60 presents (nav.py's screenshots); TTT2_FBDUMP=0 (installed copies) skips
+    // the read-back. TTT2_FBDUMP=request writes it only when fbdump.request appears (nav.py asks),
+    // so timing runs have no periodic read-back stall.
+    static const int fbdump = [] {
+        const char* e = std::getenv("TTT2_FBDUMP");
+        return (e && *e == '0') ? 0 : (e && std::strcmp(e, "request") == 0) ? 2 : 1;
+    }();
+    static const std::string request = [] {
+        const char* tag = std::getenv("TTT2_INSTANCE");
+        return std::string("C:/ttt2/port/fbdump") + (tag ? tag : "") + ".request";
+    }();
+    bool dump = fbdump == 1 && frames % 60 == 0;
+    if (fbdump == 2 && frames % 10 == 0 && GetFileAttributesA(request.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        unsigned count = 0, every = 1;
+        if (FILE* f = std::fopen(request.c_str(), "r"))
+        {
+            if (std::fscanf(f, "seq %u %u", &count, &every) != 2) count = 0;
+            std::fclose(f);
+        }
+        if (count) { burstLeft = count; burstEvery = (std::max)(1u, every); burstIndex = 0; DeleteFileA(request.c_str()); }
+        else dump = DeleteFileA(request.c_str()) != 0;
+    }
+    if (seq || dump)
+    {
+        static std::vector<uint32_t> staging(FB_W * FB_H);
+        if (GpuHwReadFrontBuffer(staging.data()))
+        {
+            if (seq)
+            {
+                CreateDirectoryA("C:/ttt2/port/fb", nullptr);
+                char fp[128];
+                if (burst)
+                {
+                    BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/burst_%04u.bmp", burstIndex);
+                    // When this frame was presented (input latency tests: compare with the
+                    // "[input] buttons ... visible" line, same clock).
+                    std::fprintf(stderr, "[burst] %04u at %.1f ms\n", burstIndex++,
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    --burstLeft;
+                }
+                else BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/frame_%04u.bmp", frames / (uint32_t)seqEvery);
+                WriteBmpTo(fp, staging.data());
+            }
+            if (dump)
+            {
+                WriteFrontBufferBmp(staging.data());
+                uint32_t nz = 0;
+                for (uint32_t i = 0; i < FB_W * FB_H; i += 97) nz += staging[i] != 0;
+                std::fprintf(stderr, "[vd] present(hw) fb=%08X frame=%u staging[mid]=%08X nz=%u\n",
+                             fb, frames, staging[(FB_H / 2) * FB_W + FB_W / 2], nz);
+            }
+        }
+    }
+    g_diagPresentFb = fb;      // TEST ONLY (p_diag29)
+    DiagSpikeFrame(frames);
+    ++frames;
+}
+
+// --- PM4 command processor (own thread, asynchronous to the vblank ticker). Walks the
+// ring from rptr to the doorbell-published wptr, executes indirect buffers, and implements
+// the packets the D3D runtime's fence machinery depends on (spec: PROJECT_STATUS session 5):
+//   - type-0 register writes; SCRATCH_REG0..7 (0x578-0x57F) mirrored to the guest scratch
+//     shadow at [device+11028] (the ISR reads the fence callback fn/arg from there!)
+//   - WAIT_REG_MEM (0x3C): poll guest memory or our register file until satisfied
+//   - CP_INTERRUPT (0x54): invoke the guest ISR with source=1 for each CPU in the mask
+//   - EVENT_WRITE_SHD (0x58): fence value writes (segment retirement via sysCmdBuf+0/+4)
+//   - MEM_WRITE (0x3D), INDIRECT_BUFFER (0x3F) / _PFD (0x37), INVALIDATE_STATE etc. ---
+static uint32_t g_opcodeSeen[128];
+static std::atomic<uint32_t> g_ringRptr{0}; // CP owns writes; vblank observes ring progress
+static uint32_t g_regFile[0x8000];     // GPU register file (word index)
+
+// ---- GPU milestone 1: EDRAM fast-clear + resolve-to-memory (CPU-only). With no draws
+// rasterized yet, EDRAM content per color_base is fully described by the last clear, so we
+// latch clear colors and fill the resolve destination with them. The present window shows
+// the result (the game's real clear colors = first non-black pixels). ----
+static std::unordered_map<uint32_t, uint32_t> g_edramClear;   // color_base -> RB_COLOR_CLEAR (red in the low byte)
+static std::atomic<uint32_t> g_resolvesToFront{ 0 };  // resolves into the presented surface
+static uint32_t g_curVs = 0, g_curPs = 0;                     // latched ucode guest addrs
+static uint32_t g_curVsSize = 0, g_curPsSize = 0;             // ucode size in dwords
+
+// ---- Bring-up instrumentation (env-gated; a normal run stays quiet) ----------------
+// TTT2_PM4TRACE=<n> : dump the first n PM4 packets in stream order with their payload.
+// TTT2_DRAWDUMP=<n> : dump the FULL pipeline state at the first n RECTLIST draws
+//                     (all constants, fetch constants, viewport, shader ucode).
+static int g_pm4Trace = -1;
+static int g_drawDump = -1;
+
+static int EnvInt(const char* name, int dflt)
+{
+    const char* s = std::getenv(name);
+    return s ? (int)std::strtol(s, nullptr, 0) : dflt;
+}
+
+static void InitGpuTrace()
+{
+    if (g_pm4Trace < 0) g_pm4Trace = EnvInt("TTT2_PM4TRACE", 0);
+    if (g_drawDump < 0) g_drawDump = EnvInt("TTT2_DRAWDUMP", 8);
+}
+
+// TTT2_SHADER_DUMP=1: write each new shader's microcode to port/shaders (bring-up). Off by
+// default: it hashed every shader load and wrote a file + log line per new shader on the CP
+// thread, exactly when a fight starts or a new effect appears.
+static void DumpShaderBlob(uint32_t type, uint32_t addr, uint32_t sizeDwords)
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_SHADER_DUMP"); return e && *e == '1'; }();
+    if (!on) return;
+    uint64_t h = 1469598103934665603ull;                      // FNV-1a over the ucode
+    for (uint32_t i = 0; i < sizeDwords; ++i)
+    {
+        h ^= GRead32(g_base, addr + i * 4);
+        h *= 1099511628211ull;
+    }
+    static std::unordered_map<uint64_t, bool> seen;
+    if (seen.count(h)) return;
+    seen[h] = true;
+    CreateDirectoryA("C:/ttt2/port/shaders", nullptr);
+    char path[128];
+    BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/shaders/%s_%016llX.bin",
+                  type == 0 ? "vs" : "ps", (unsigned long long)h);
+    if (FILE* f = std::fopen(path, "wb"))
+    {
+        for (uint32_t i = 0; i < sizeDwords; ++i)
+        {
+            uint32_t d = GRead32(g_base, addr + i * 4);
+            std::fwrite(&d, 4, 1, f);
+        }
+        std::fclose(f);
+    }
+    std::fprintf(stderr, "[gpu] shader %s %u dwords -> %s\n", type == 0 ? "VS" : "PS",
+                 sizeDwords, path);
+}
+
+// TTT2_DUMPCONTAINERS=<seconds>: after that long, sweep the guest heaps for Xbox 360 shader
+// CONTAINERS and write each one out for offline XenosRecomp translation. The executable image
+// only holds XDK library shaders (video decode / XUI / 2D sprite) - TTT2's own shaders live
+// compressed inside the dataNNN.bin archives, so the only place they are ever in container
+// form is guest RAM, after the loader has decompressed them. Validity test matches
+// tools/XenosRecomp/XenosRecomp/main.cpp:91-94 exactly, and the bytes are written RAW
+// (big-endian, as they sit in guest memory) because that is what XenosRecomp parses.
+static void SweepShaderContainers()
+{
+    CreateDirectoryA("C:/ttt2/port/shaders", nullptr);
+    CreateDirectoryA("C:/ttt2/port/shaders/containers", nullptr);
+    struct { uint32_t lo, hi; } ranges[] = {
+        { VHEAP_BEGIN, VHEAP_END }, { PHEAP_BEGIN, PHEAP_END } };
+    uint32_t found = 0;
+    for (auto& rg : ranges)
+    {
+        for (uint32_t a = rg.lo; a + 40 < rg.hi; a += 4)
+        {
+            if ((GRead32(g_base, a) & 0xFFFFFF00u) != 0x102A1100u) continue;
+            uint32_t virt = GRead32(g_base, a + 4), phys = GRead32(g_base, a + 8);
+            uint32_t f1C = GRead32(g_base, a + 28), f20 = GRead32(g_base, a + 32);
+            uint64_t dataSize = (uint64_t)virt + phys;
+            if (f1C || f20 || dataSize < 40 || dataSize > 0x40000 ||
+                a + dataSize >= rg.hi) continue;
+            char path[160];
+            BoundedSnprintf(path, sizeof(path),
+                          "C:/ttt2/port/shaders/containers/gc_%08X.bin", a);
+            if (FILE* f = std::fopen(path, "wb"))
+            {
+                std::fwrite(g_base + a, 1, (size_t)dataSize, f);
+                std::fclose(f);
+                ++found;
+            }
+            a += (uint32_t)dataSize - 4;
+        }
+    }
+    std::fprintf(stderr, "[gpu] container sweep: %u written to port/shaders/containers\n", found);
+}
+
+// Dump every piece of pipeline state a software rasterizer would need, at a real draw.
+// Constant banks live in the same register file as context registers on Xenos:
+//   0x4000..0x47FF ALU float constants (512 x float4), 0x4800..0x48BF fetch constants
+//   (32 texture x 6 dwords == 96 vertex x 2 dwords), 0x4900.. bool, 0x4908.. loop.
+static int g_dumpSkip = -1;            // TTT2_DUMPSKIP: ignore the first n content draws
+
+static void DumpDrawState(uint32_t initiator, uint32_t op)
+{
+    if (g_drawDump <= 0) return;
+    if (g_dumpSkip < 0)
+    {
+        const char* e = std::getenv("TTT2_DUMPSKIP");
+        g_dumpSkip = e ? (int)std::strtol(e, nullptr, 0) : 0;
+    }
+    if (g_dumpSkip > 0) { --g_dumpSkip; return; }   // let the budget fire late in the run
+    --g_drawDump;
+    uint32_t prim = initiator & 0x3F, srcSel = (initiator >> 6) & 3;
+    uint32_t numIdx = initiator >> 16;
+    std::fprintf(stderr,
+        "[dd] ===== DRAW op=%02X initiator=%08X prim=%u srcSel=%u numIndices=%u =====\n",
+        op, initiator, prim, srcSel, numIdx);
+
+    // Context registers: everything nonzero in the 0x2000 block, in one place.
+    for (uint32_t r = 0x2000; r < 0x2400; ++r)
+        if (g_regFile[r]) std::fprintf(stderr, "[dd] ctx %04X = %08X\n", r, g_regFile[r]);
+    // Non-context / config registers the stream touched.
+    for (uint32_t r = 0x0000; r < 0x2000; ++r)
+        if (g_regFile[r]) std::fprintf(stderr, "[dd] cfg %04X = %08X\n", r, g_regFile[r]);
+
+    // ALU float constants (report as float4 rows; only nonzero rows).
+    uint32_t aluRows = 0;
+    for (uint32_t i = 0; i < 512; ++i)
+    {
+        const uint32_t* c = &g_regFile[0x4000 + i * 4];
+        if (!(c[0] | c[1] | c[2] | c[3])) continue;
+        if (++aluRows > 400) { std::fprintf(stderr, "[dd] alu ... (more)\n"); break; }
+        float f[4];
+        for (int k = 0; k < 4; ++k) std::memcpy(&f[k], &c[k], 4);
+        std::fprintf(stderr, "[dd] alu c%-3u = %08X %08X %08X %08X  (%g %g %g %g)\n",
+                     i, c[0], c[1], c[2], c[3], f[0], f[1], f[2], f[3]);
+    }
+    // Raw fetch-constant block: print all 192 dwords in rows of 6 (texture-fetch view).
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        const uint32_t* c = &g_regFile[0x4800 + i * 6];
+        if (!(c[0] | c[1] | c[2] | c[3] | c[4] | c[5])) continue;
+        std::fprintf(stderr, "[dd] fetch6 slot%-2u = %08X %08X %08X %08X %08X %08X\n",
+                     i, c[0], c[1], c[2], c[3], c[4], c[5]);
+    }
+    for (uint32_t i = 0; i < 96; ++i)
+    {
+        const uint32_t* c = &g_regFile[0x4800 + i * 2];
+        if (!(c[0] | c[1])) continue;
+        // A vertex fetch constant is {type(1:0)=3 | address(31:2), endian(1:0) | size(25:2)}.
+        uint32_t addr = PhysToGuest(c[0] & ~3u), sz = (c[1] >> 2) & 0xFFFFFF;
+        std::fprintf(stderr, "[dd] fetch2 slot%-2u = %08X %08X  type=%u addr=%08X size=%u dw\n",
+                     i, c[0], c[1], c[0] & 3, addr, sz);
+        // Dump the head of the buffer whatever the size field says - the size is in dwords and
+        // is routinely far larger than anything worth printing, but the first few vertices are
+        // exactly what tells us whether a fetch is reading real data.
+        if ((c[0] & 3) != 3 || !sz || !addr) continue;
+        for (uint32_t k = 0; k < sz && k < 32; k += 4)
+        {
+            char line[200]; int n = 0;
+            n += BoundedSnprintf(line + n, sizeof(line) - n, "[dd]   vb+%02u:", k);
+            for (uint32_t j = 0; j < 4 && k + j < sz; ++j)
+                n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X",
+                                   GRead32(g_base, addr + (k + j) * 4));
+            n += BoundedSnprintf(line + n, sizeof(line) - n, "  f:");
+            for (uint32_t j = 0; j < 4 && k + j < sz; ++j)
+            {
+                uint32_t u = GRead32(g_base, addr + (k + j) * 4);
+                float f; std::memcpy(&f, &u, 4);
+                n += BoundedSnprintf(line + n, sizeof(line) - n, " %g", f);
+            }
+            BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+            std::fputs(line, stderr);
+        }
+    }
+    for (uint32_t r = 0x4900; r < 0x4940; ++r)
+        if (g_regFile[r]) std::fprintf(stderr, "[dd] boolloop %04X = %08X\n", r, g_regFile[r]);
+
+    // Shader ucode currently bound, with a full hex dump so it can be disassembled offline.
+    struct { const char* n; uint32_t a, sz; } sh[2] = {
+        { "VS", g_curVs, g_curVsSize }, { "PS", g_curPs, g_curPsSize } };
+    for (auto& s : sh)
+    {
+        std::fprintf(stderr, "[dd] %s ucode @%08X %u dwords\n", s.n, s.a, s.sz);
+        for (uint32_t i = 0; i < s.sz && i < 256; i += 6)
+        {
+            char line[160]; int n = 0;
+            n += BoundedSnprintf(line + n, sizeof(line) - n, "[dd] %s+%03u:", s.n, i);
+            for (uint32_t k = 0; k < 6 && i + k < s.sz; ++k)
+                n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X",
+                                   GRead32(g_base, s.a + (i + k) * 4));
+            BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+            std::fputs(line, stderr);
+        }
+    }
+    std::fprintf(stderr, "[dd] ===== end draw =====\n");
+}
+
+// ---- Frame inventory (diagnostics). Create C:/ttt2/port/framelog.trigger while the game
+// runs: the next complete frame (swap to swap) is written to C:/ttt2/port/framelog_<n>.txt with
+// every draw's render targets, formats, state and sampled texture formats, and every resolve's
+// source/destination. Field layouts: Xenia registers.h / xenos.h (tools/ref_xenia).
+static FILE* g_frameLog = nullptr;
+extern void (*g_gpuFrameNote)(const char*);
+static void FrameLogNote(const char* text) { if (g_frameLog) std::fputs(text, g_frameLog); }
+static uint32_t g_frameLogDraws = 0;
+static void FrameLogSwap()
+{
+    static uint32_t frame = 0, check = 0;
+    ++frame;
+    if (g_frameLog)
+    {
+        std::fprintf(g_frameLog, "== end of frame %u (%u draws)\n", frame - 1, g_frameLogDraws);
+        std::fclose(g_frameLog);
+        g_frameLog = nullptr;
+        g_gpuFrameNote = nullptr;
+        std::fprintf(stderr, "[framelog] frame %u written\n", frame - 1);
+    }
+    if (++check % 30) return;                          // poll the trigger twice a second
+    if (GetFileAttributesA("C:/ttt2/port/framelog.trigger") == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA("C:/ttt2/port/framelog.trigger");
+    char path[96];
+    BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/framelog_%u.txt", frame);
+    g_frameLog = std::fopen(path, "w");
+    g_frameLogDraws = 0;
+    g_gpuFrameNote = g_frameLog ? FrameLogNote : nullptr;
+    if (g_frameLog) std::fprintf(g_frameLog, "== frame %u\n", frame);
+}
+static void FrameLogTexture(uint32_t slot)
+{
+    const uint32_t* c = &g_regFile[0x4800 + slot * 6];
+    if ((c[0] & 3) != 2) { std::fprintf(g_frameLog, "    t%u: not a texture (type %u)\n", slot, c[0] & 3); return; }
+    std::fprintf(g_frameLog,
+        "    t%u: base=%08X fmt=%u %s endian=%u %ux%u pitch=%u dim=%u swz=%03X clamp=%u/%u/%u "
+        "filt mag%u min%u mip%u miplv %u-%u mipaddr=%08X packed=%u sign=%X numfmt=%u expadj=%d\n",
+        slot, (c[1] >> 12) << 12, c[1] & 0x3F, (c[0] >> 31) ? "tiled" : "linear", (c[1] >> 6) & 3,
+        (c[2] & 0x1FFF) + 1, ((c[2] >> 13) & 0x1FFF) + 1, ((c[0] >> 22) & 0x1FF) * 32, (c[5] >> 9) & 3,
+        (c[3] >> 1) & 0xFFF, (c[0] >> 10) & 7, (c[0] >> 13) & 7, (c[0] >> 16) & 7,
+        (c[3] >> 19) & 3, (c[3] >> 21) & 3, (c[3] >> 23) & 3, (c[4] >> 2) & 15, (c[4] >> 6) & 15,
+        (c[5] >> 12) << 12, (c[5] >> 11) & 1, (c[0] >> 2) & 0xFF, c[3] & 1, ((int32_t)(c[3] << 13)) >> 26);
+}
+static void FrameLogDraw(uint32_t init)
+{
+    if (!g_frameLog) return;
+    const uint32_t* r = g_regFile;
+    ++g_frameLogDraws;
+    const uint32_t mode = r[0x2208] & 7, surf = r[0x2000], ci = r[0x2001], di = r[0x2002];
+    std::fprintf(g_frameLog,
+        "draw %u prim=%u n=%u src=%u mode=%u | surf pitch=%u msaa=%u | c0 base=%03X fmt=%u bias=%d mask=%04X | "
+        "c1=%08X c2=%08X c3=%08X | depth base=%03X fmt=%u ctl=%08X | blend0=%08X b1=%08X | cull=%08X vte=%08X | "
+        "vs=%08X/%u ps=%08X/%u sqcntl=%08X misc=%08X\n",
+        g_frameLogDraws, init & 0x3F, init >> 16, (init >> 6) & 3, mode, surf & 0x3FFF, (surf >> 16) & 3,
+        ci & 0xFFF, (ci >> 16) & 15, ((int32_t)(ci << 6)) >> 26, r[0x2104] & 0xFFFF,
+        r[0x2003], r[0x2004], r[0x2005], di & 0xFFF, (di >> 16) & 1, r[0x2200], r[0x2201], r[0x2209],
+        r[0x2205], r[0x2206], g_curVs, g_curVsSize, g_curPs, g_curPsSize, r[0x2180], r[0x2181]);
+    if (g_curPs && g_curPsSize && g_curPsSize < 4096)
+    {
+        // The pixel shader's microcode hash, as TTT2_SHADER_DUMP names port/shaders/ps_<hash>.bin
+        // (written here too, so the frame's shaders can be disassembled with ucode_disasm.py).
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < g_curPsSize; ++i) { h ^= GRead32(g_base, g_curPs + i * 4); h *= 1099511628211ull; }
+        std::fprintf(g_frameLog, "    ps hash %016llX\n", (unsigned long long)h);
+        char path[128];
+        BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/shaders/ps_%016llX.bin", (unsigned long long)h);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+            if (FILE* f = std::fopen(path, "wb"))
+            {
+                for (uint32_t i = 0; i < g_curPsSize; ++i)
+                {
+                    const uint32_t w = GRead32(g_base, g_curPs + i * 4);
+                    std::fwrite(&w, 4, 1, f);
+                }
+                std::fclose(f);
+            }
+    }
+    if (mode == 6)
+    {
+        const uint32_t cc = r[0x2318], info = r[0x231B];
+        std::fprintf(g_frameLog,
+            "  RESOLVE src=%u sample=%u clrC=%u clrZ=%u cmd=%u dest=%08X pitch=%u h=%u | dest fmt=%u endian=%u "
+            "num=%u bias=%d swap=%u array=%u slice=%u | clear c=%08X z=%08X | win_off=%08X sc=%08X..%08X\n",
+            cc & 7, (cc >> 4) & 7, (cc >> 8) & 1, (cc >> 9) & 1, (cc >> 20) & 3, r[0x2319], r[0x231A] & 0x3FFF,
+            (r[0x231A] >> 16) & 0x3FFF, (info >> 7) & 0x3F, info & 7, (info >> 13) & 7,
+            ((int32_t)(info << 10)) >> 26, (info >> 24) & 1, (info >> 3) & 1, (info >> 4) & 7,
+            r[0x231E], r[0x231D], r[0x2080], r[0x2081], r[0x2082]);
+        return;
+    }
+    const uint32_t slots = GpuPixelShaderTextureSlots(g_curPs, g_curPsSize);
+    for (uint32_t s = 0; s < 32; ++s)
+        if (slots & (1u << s)) FrameLogTexture(s);
+}
+
+// Format census (TTT2_FORMAT_CENSUS=1): resolves, gamma LUT writes; textures,
+// targets and vertex formats in the hardware backend.
+static bool FormatCensusOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_FORMAT_CENSUS"); return e && *e == '1'; }();
+    return on;
+}
+
+// A draw issued with RB_MODECONTROL edram-mode COPY performs the resolve described by the
+// RB_COPY_* registers. copy_command 3 + clear bits = pure fast-clear (latch only).
+static uint32_t traceDumpDest = 0;     // resolve-trace: dump this destination after resolving
+static void IssueResolve()
+{
+    uint32_t ctrl = g_regFile[0x2318];
+    uint32_t copyCmd = (ctrl >> 20) & 3;
+    bool clearColor = (ctrl & (1u << 8)) != 0;
+    uint32_t colorBase = g_regFile[0x2001] & 0xFFFu;
+    // The hardware backend keys colour surfaces by EDRAM base and colour format.
+    const uint32_t hwColorKey = colorBase | (((g_regFile[0x2001] >> 16) & 0xFu) << 12);
+    uint32_t clearVal = g_regFile[0x231E];
+    uint32_t destBase = PhysToGuest(g_regFile[0x2319] & ~0xFFFu);
+    uint32_t pitch = g_regFile[0x231A] & 0x3FFFu;
+    uint32_t height = (g_regFile[0x231A] >> 16) & 0x3FFFu;
+    uint32_t destInfo = g_regFile[0x231B];
+    // The resolve destination is written TILED: the swap packet's own texture fetch block
+    // for this exact surface reads 8A000002 A44A9006 ... - dword0 bit31 (tiled) is set,
+    // pitch field 40*32 = 1280, format 8_8_8_8 - and the present path un-tiles it.
+    // (RB_COPY_DEST_INFO bit3 is copy_dest_array, not a tiling flag.)
+    bool tiled = true;
+    static int rlog = 0;
+    if (rlog < 40)
+    {
+        ++rlog;
+        std::fprintf(stderr,
+            "[gpu] resolve cmd=%u ctrl=%08X cbase=%03X clr=%08X dest=%08X %ux%u info=%08X%s\n",
+            copyCmd, ctrl, colorBase, clearVal, destBase, pitch, height, destInfo,
+            tiled ? " tiled" : "");
+    }
+    {
+        // Resolves of non-8_8_8_8 surfaces or into non-8_8_8_8 destinations (e.g. GPU DXT
+        // compression through 64-bpp targets) - the hardware path models only 32-bpp ARGB.
+        const uint32_t colorFmt = (g_regFile[0x2001] >> 16) & 0xF, destFmt = (destInfo >> 7) & 0x3F;
+        static std::atomic<int> oddLog{ 400 };
+        if ((colorFmt != 0 || (destFmt != 6 && (ctrl & 7) != 4)) && oddLog.fetch_sub(1) > 0)
+            std::fprintf(stderr, "[resolve-odd] src=%u cbase=%03X colorFmt=%u pitch(surf)=%u msaa=%u dest=%08X %ux%u destFmt=%u endian=%u swap=%u ctrl=%08X\n",
+                         ctrl & 7, colorBase, colorFmt, g_regFile[0x2000] & 0x3FFF, (g_regFile[0x2000] >> 16) & 3,
+                         destBase, pitch, height, destFmt, destInfo & 7, (destInfo >> 24) & 1, ctrl);
+    }
+    {
+        // Format census (TTT2_FORMAT_CENSUS=1, with the backend's texture/target/vertex census):
+        // the first resolve of every source format / destination format / endian / swap.
+        const bool census = FormatCensusOn();
+        static std::unordered_map<uint32_t, uint32_t> seen;
+        const uint32_t key = ((g_regFile[0x2001] >> 16) & 0xF) | (((destInfo >> 7) & 0x3F) << 4) | ((destInfo & 7) << 10) |
+                             (((destInfo >> 24) & 1) << 13) | ((ctrl & 7) << 14) | (copyCmd << 17) | ((clearColor ? 1u : 0u) << 19);
+        if (census && !seen[key]++)
+            std::fprintf(stderr, "[census] resolve src=%u cfmt=%u destFmt=%u endian=%u swap=%u cmd=%u clearC=%u clear=%08X (first: dest=%08X %ux%u)\n",
+                         ctrl & 7, (g_regFile[0x2001] >> 16) & 0xF, (destInfo >> 7) & 0x3F, destInfo & 7, (destInfo >> 24) & 1,
+                         copyCmd, clearColor ? 1u : 0u, clearVal, destBase, pitch, height);
+    }
+    {
+        // Diagnostics: create C:/ttt2/port/resolvelog.trigger to log the next 400 resolves (e.g.
+        // across a loading screen, where the character texture bake renders and resolves).
+        static int traceLeft = 0;
+        traceDumpDest = 0;
+        // Polled twice a second (a file-system call: every 64 resolves was ~70 a second).
+        static auto nextCheck = std::chrono::steady_clock::now();
+        const auto checkNow = std::chrono::steady_clock::now();
+        if (checkNow >= nextCheck && (nextCheck = checkNow + std::chrono::milliseconds(500),
+                                      GetFileAttributesA("C:/ttt2/port/resolvelog.trigger") != INVALID_FILE_ATTRIBUTES))
+        {
+            DeleteFileA("C:/ttt2/port/resolvelog.trigger");
+            traceLeft = 400;
+        }
+        if (traceLeft > 0)
+        {
+            --traceLeft;
+            std::fprintf(stderr, "[resolve-trace] src=%u cbase=%03X cfmt=%u surf=%u msaa=%u dest=%08X %ux%u destFmt=%u endian=%u swap=%u cmd=%u clr=%u/%u ps=%08X/%u\n",
+                         ctrl & 7, colorBase, (g_regFile[0x2001] >> 16) & 0xF, g_regFile[0x2000] & 0x3FFF,
+                         (g_regFile[0x2000] >> 16) & 3, destBase, pitch, height, (destInfo >> 7) & 0x3F, destInfo & 7,
+                         (destInfo >> 24) & 1, copyCmd, clearColor ? 1u : 0u, (ctrl >> 9) & 1, g_curPs, g_curPsSize);
+            traceDumpDest = (pitch == height && (pitch == 512 || pitch == 1024 || pitch == 128)) ? destBase : 0;
+        }
+    }
+    const int hw = GpuHwMode();                                // 0 CPU, 1 GPU, 2 compare
+    static std::vector<uint32_t> lin;
+    if ((copyCmd == 0 || copyCmd == 1) && hw == 1 &&
+        destBase && pitch && height && pitch <= 4096 && height <= 4096)
+    {
+        // Hardware backend: copy the GPU surface into the GPU texture registered for
+        // destBase; guest memory is only written when something needs the bytes. Compare
+        // mode resolves after the CPU path below, so the GPU entry also adopts its writes.
+        // copy_src_select 4 resolves DEPTH (TTT2's shadow map and scene depth, sampled as
+        // 24_8_FLOAT); the CPU path below still copies colour for it (documented divergence).
+        auto latch = g_edramClear.find(colorBase);
+        FrontResolveArgs args;
+        args.key = hwColorKey; args.dest = destBase; args.pitch = pitch; args.height = height;
+        args.hasLatch = latch != g_edramClear.end(); args.latch = args.hasLatch ? latch->second : 0;
+        args.swap = ((destInfo >> 24) & 1) != 0; args.src = ctrl & 7u;
+        args.depthBase = g_regFile[0x2002] & 0xFFFu; args.depthFloat = ((g_regFile[0x2002] >> 16) & 1u) != 0;
+        args.format = (destInfo >> 7) & 0x3Fu;
+        GpuHwResolve(args.key, args.dest, args.pitch, args.height, args.hasLatch, args.latch, args.swap,
+                     args.src, args.depthBase, args.depthFloat, args.format);
+        if (destBase == g_frontBufferPhys.load())
+        {
+            if (g_earlySwap == g_cpMarkers + 1 && !(args == g_earlyArgs)) g_earlyMismatch = true;
+            g_frontArgs = args;
+            g_frontArgsAt = g_cpMarkers;
+        }
+        if (traceDumpDest == destBase)
+        {
+            static uint32_t traceDumps = 0;
+            if (traceDumps < 40)
+            {
+                CreateDirectoryA("C:/ttt2/port/resolve_trace", nullptr);
+                char path[128];
+                BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/resolve_trace/%03u_%08X_%ux%u_ps%u.bmp",
+                                traceDumps++, destBase, pitch, height, g_curPsSize);
+                GpuHwDumpResolved(destBase, path);
+            }
+        }
+        if (g_frameLog)
+        {
+            static uint32_t dumpIndex = 0;
+            CreateDirectoryA("C:/ttt2/port/framelog_dump", nullptr);
+            char path[128];
+            BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/framelog_dump/%03u_draw%u_src%u_%08X_%ux%u.bmp",
+                            dumpIndex++, g_frameLogDraws, ctrl & 7, destBase, pitch, height);
+            GpuHwDumpResolved(destBase, path);
+        }
+    }
+    if ((copyCmd == 0 || copyCmd == 1) && hw != 1)              // raw / convert copy (CPU)
+    {
+        if (destBase && pitch && height && pitch <= 4096 && height <= 4096)
+        {
+            // Source: the EDRAM-lite surface the rasterizer filled. Falls back to the
+            // fast-clear latch when nothing has been rasterized into this colour base.
+            lin.assign((size_t)pitch * height, 0);
+            bool fromEdram = GpuReadEdram(colorBase, pitch, height, lin.data());
+            if (!fromEdram)
+            {
+                auto it = g_edramClear.find(colorBase);
+                uint32_t px = it != g_edramClear.end() ? it->second : 0;
+                px = (px & 0xFF00FF00u) | ((px >> 16) & 0xFFu) | ((px & 0xFFu) << 16);   // red low -> ARGB
+                std::fill(lin.begin(), lin.end(), px);
+            }
+            // TTT2_GPUTEST=1: write a recognisable gradient instead, to prove
+            // resolve -> tiling -> present -> window end to end independently of the
+            // rasterizer (stage 0 of the render bring-up).
+            static const bool test = std::getenv("TTT2_GPUTEST") != nullptr;
+            uint32_t widthAligned = (pitch + 31) & ~31u;
+            // The hardware's k_8_8_8_8 word holds red in the LOW byte (0xAABBGGRR); RB_COPY_DEST_INFO
+            // bit 24 copy_dest_swap exchanges red and blue, giving the D3DFMT_A8R8G8B8 word
+            // 0xAARRGGBB that the CPU reads and the fetch swizzle .zyxw / .zyx1 samples as RGBA
+            // (every battle resolve and the front buffer swap). lin holds 0xAARRGGBB.
+            const bool swapRB = (destInfo >> 24) & 1;
+            for (uint32_t y = 0; y < height; ++y)
+                for (uint32_t x = 0; x < pitch; ++x)
+                {
+                    uint32_t off = tiled ? TiledOffset32(x, y, widthAligned) : (y * pitch + x);
+                    uint32_t v = lin[(size_t)y * pitch + x];
+                    if (!swapRB) v = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+                    if (test)
+                        v = 0xFF000000u | ((x * 255 / pitch) << 16) |
+                            ((y * 255 / height) << 8) | (((x ^ y) & 0x20) ? 0xFF : 0x00);
+                    GWrite32(g_base, destBase + off * 4, v);
+                }
+            // TTT2_RESOLVEDUMP=1: the linear EDRAM readback for this pass, before tiling.
+            // Shows which stage of the multi-pass chain the transposed image comes from.
+            static const bool rdump = std::getenv("TTT2_RESOLVEDUMP") != nullptr;
+            // Only dump a pass that actually produced colour, and only twice per
+            // source/destination pair: every resolve is a 4 MB write and dumping all of them
+            // starves the command processor badly enough that the run never reaches the logo.
+            bool worthDumping = false;
+            if (rdump)
+            {
+                for (size_t i = 0; i < lin.size(); i += 17)
+                    if (lin[i] & 0x00FFFFFFu) { worthDumping = true; break; }
+                static std::unordered_map<uint64_t, int> done;
+                uint64_t key = ((uint64_t)colorBase << 32) | destBase;
+                if (worthDumping && done[key]++ >= 2) worthDumping = false;
+            }
+            if (worthDumping)
+            {
+                CreateDirectoryA("C:/ttt2/port/tex", nullptr);
+                char rp[160];
+                BoundedSnprintf(rp, sizeof(rp), "C:/ttt2/port/tex/resolve_%03X_%08X_%ux%u.bmp",
+                              colorBase, destBase, pitch, height);
+                if (FILE* rf = std::fopen(rp, "wb"))
+                {
+                    uint32_t isz = pitch * height * 4;
+                    uint8_t rh[54] = {};
+                    rh[0] = 'B'; rh[1] = 'M';
+                    *reinterpret_cast<uint32_t*>(rh + 2) = 54 + isz;
+                    *reinterpret_cast<uint32_t*>(rh + 10) = 54;
+                    *reinterpret_cast<uint32_t*>(rh + 14) = 40;
+                    *reinterpret_cast<int32_t*>(rh + 18) = (int32_t)pitch;
+                    *reinterpret_cast<int32_t*>(rh + 22) = -(int32_t)height;
+                    *reinterpret_cast<uint16_t*>(rh + 26) = 1;
+                    *reinterpret_cast<uint16_t*>(rh + 28) = 32;
+                    *reinterpret_cast<uint32_t*>(rh + 34) = isz;
+                    std::fwrite(rh, 1, sizeof(rh), rf);
+                    std::fwrite(lin.data(), 4, (size_t)pitch * height, rf);
+                    std::fclose(rf);
+                }
+            }
+            if (rlog < 40)
+            {
+                uint32_t midOff = TiledOffset32(pitch / 2, height / 2, widthAligned);
+                std::fprintf(stderr,
+                    "[gpu] resolve src=%s test=%d first=%08X mid=%08X "
+                    "wrote[%08X]=%08X wrote[mid]=%08X\n",
+                    fromEdram ? "edram" : "clear", (int)test, lin[0],
+                    lin[(size_t)(height / 2) * pitch + pitch / 2], destBase,
+                    GRead32(g_base, destBase), GRead32(g_base, destBase + midOff * 4));
+            }
+            if (hw == 2)
+            {
+                // Diagnostics: the first resolves of each destination-info combination.
+                {
+                    static std::unordered_map<uint64_t, int> seen;
+                    int& n = seen[(uint64_t(destInfo) << 16) ^ pitch];
+                    if (n++ < 2)
+                        std::fprintf(stderr, "[gpu] resolve dest=%08X %ux%u destInfo=%08X (fmt %u endian %u swap %u) edram fmt %u\n",
+                                     destBase, pitch, height, destInfo, (destInfo >> 7) & 0x3Fu, destInfo & 7u,
+                                     (destInfo >> 24) & 1u, (g_regFile[0x2001] >> 16) & 0xFu);
+                }
+                auto latch = g_edramClear.find(colorBase);
+                GpuHwResolve(hwColorKey, destBase, pitch, height, latch != g_edramClear.end(),
+                             latch != g_edramClear.end() ? latch->second : 0, swapRB,
+                             ctrl & 7u, g_regFile[0x2002] & 0xFFFu, ((g_regFile[0x2002] >> 16) & 1u) != 0,
+                             (destInfo >> 7) & 0x3Fu);
+                if ((ctrl & 7u) != 4u) GpuHwCompareResolve(destBase, lin.data(), pitch, height);
+            }
+        }
+    }
+    if (clearColor) g_edramClear[colorBase] = clearVal;
+    if (destBase == g_frontBufferPhys.load()) ++g_resolvesToFront;
+    // The destination's bytes changed behind the CPU: drop any cached-view copy of them
+    // (phys_mirror.cpp). Sized for 64 bpp tiled destinations; closing extra chunks is free.
+    if ((copyCmd == 0 || copyCmd == 1) && destBase && pitch && height)
+        PhysMirrorInvalidate(destBase, ((pitch + 31) & ~31u) * ((height + 31) & ~31u) * 8u);
+}
+
+// SCRATCH_ADDR (reg 0x01DD) holds the PHYSICAL base of the scratch-register memory shadow;
+// hardware copies SCRATCH_REG0..7 there for every register whose bit is set in SCRATCH_UMSK
+// (reg 0x01DC). The D3D runtime caches the same block's virtual address at device+11028 and
+// the CPU side reads AND WRITES it directly: the graphics ISR (sub_82738AD8) clears its own
+// CPU bit in [shadow+0] under a spinlock, which is exactly what the "wait scratch0 == 0"
+// WAIT_REG_MEM in the fence-arming sequence is waiting for.
+static uint32_t ScratchShadow()
+{
+    uint32_t dev = g_intrContext.load();
+    uint32_t s = dev ? GRead32(g_base, dev + 11028) : 0;
+    if (s) return s;
+    uint32_t phys = g_regFile[0x01DD];
+    return phys ? PhysToGuest(phys) : 0;
+}
+
+static void MirrorScratch(uint32_t reg, uint32_t value)
+{
+    // Mirror into the MMIO register aperture too, so a guest read-back of the register
+    // sees what the command stream wrote.
+    GWrite32(g_base, 0x7FC80000u + reg * 4, value);
+    uint32_t shadow = ScratchShadow();
+    if (shadow) GWrite32(g_base, shadow + (reg - 0x578) * 4, value);
+}
+
+// The guest can also program GPU registers by storing straight into the MMIO aperture,
+// which never passes through the command stream. Detect those stores (aperture value
+// diverging from what we last wrote) and perform the scratch write-back hardware would.
+// One-directional on purpose: values the ISR writes into the shadow must never be
+// clobbered by a stale aperture copy, and they cannot be, because the ISR only ever
+// touches the shadow.
+static void SyncGuestScratchWrites()
+{
+    uint32_t shadow = ScratchShadow();
+    for (uint32_t reg = 0x578; reg <= 0x57F; ++reg)
+    {
+        uint32_t v = GRead32(g_base, 0x7FC80000u + reg * 4);
+        if (v == g_regFile[reg]) continue;
+        g_regFile[reg] = v;
+        if (shadow) GWrite32(g_base, shadow + (reg - 0x578) * 4, v);
+    }
+}
+
+// Where do register writes actually land? The shading path needs ALU float constants
+// (0x4000..0x47FF) and fetch constants (0x4800..0x48BF); if those buckets stay at zero the
+// game is uploading its constants by a route the command processor does not execute.
+static uint32_t g_regWrites[4];      // context, ALU const, fetch const, other
+
+// Every primitive type the game actually issues, so the renderer never silently drops one.
+static uint32_t g_primSeen[64];
+
+// Which float4 ALU constant rows the game has EVER written. A shader reading a row that is
+// never written anywhere means its constant indices are not the absolute register-file indices
+// we assume they are.
+static uint8_t g_aluEver[512];
+
+// Constant forensics. The game's 2D shader transforms every vertex by c128/c129 (a 2x3 matrix)
+// plus c131, and those rows read ZERO at draw time while c132/c133 right next to them are set.
+// To tell "never written" from "written, then clobbered" from "written after the draw", stamp
+// every write with a sequence number and print both the writes and the draw-time values.
+static uint32_t g_regSeq = 0;
+static int g_cwBudget = -1;
+static bool CwOn()
+{
+    if (g_cwBudget < 0) g_cwBudget = std::getenv("TTT2_CWATCH")
+                                   ? (int)std::strtol(std::getenv("TTT2_CWATCH"), nullptr, 0) : 0;
+    return g_cwBudget > 0;
+}
+
+// Writes to the ALU constants (CP thread): the hardware backend compares its constant buffers with the registers only
+// after one (gpu_hw_d3d11.h). VS constants: 0x4000-0x47FF; the pixel shader's half: 0x4400-0x47FF.
+uint32_t g_vsConstWrites = 1, g_psConstWrites = 1;
+// p_diag46: the registers written since each side last compared (lo > hi: none), so it compares only those.
+uint32_t g_vsConstLo = 0x4000, g_vsConstHi = 0x47FF, g_psConstLo = 0x4400, g_psConstHi = 0x47FF;
+static void WriteReg(uint32_t reg, uint32_t value)
+{
+    ++g_regSeq;
+    if (reg >= 0x4000 && reg < 0x4800)
+    {
+        ++g_vsConstWrites;
+        g_vsConstLo = (std::min)(g_vsConstLo, reg); g_vsConstHi = (std::max)(g_vsConstHi, reg);
+        if (reg >= 0x4400) { ++g_psConstWrites; g_psConstLo = (std::min)(g_psConstLo, reg); g_psConstHi = (std::max)(g_psConstHi, reg); }
+    }
+    // Display gamma LUT (DC_LUT_RW_MODE 0x1921 .. DC_LUTA_CONTROL 0x1930, Xenia register_table.inc):
+    // a game-loaded ramp is applied at scan-out on the console.
+    if (reg >= 0x1920 && reg <= 0x1930 && FormatCensusOn())
+    {
+        static int logged = 0;
+        if (logged++ < 600) std::fprintf(stderr, "[census] gamma lut reg %04X = %08X\n", reg, value);
+    }
+    if (reg >= 0x4000 + 126 * 4 && reg < 0x4000 + 140 * 4 && CwOn())
+    {
+        uint32_t row = (reg - 0x4000) / 4, comp = (reg - 0x4000) % 4;
+        --g_cwBudget;
+        std::fprintf(stderr, "[cw] seq=%u write c%u.%c = %08X\n", g_regSeq, row,
+                     "xyzw"[comp], value);
+    }
+    ++g_regWrites[reg >= 0x4800 && reg < 0x48C0 ? 2
+                : reg >= 0x4000 && reg < 0x4800 ? 1
+                : reg >= 0x2000 && reg < 0x3000 ? 0 : 3];
+    if (reg >= 0x4000 && reg < 0x4800) g_aluEver[(reg - 0x4000) / 4] = 1;
+    if (reg < 0x8000)
+    {
+        g_regFile[reg] = value;
+        GWrite32(g_base, 0x7FC80000u + reg * 4, value);   // guest-visible register aperture
+    }
+    if (reg >= 0x578 && reg <= 0x57F) { MirrorScratch(reg, value); GpuProgress(); }
+    if (reg >= 0x1922 && reg <= 0x1925) GammaRegisterWritten(reg, value);
+}
+
+static void GammaRegisterWritten(uint32_t reg, uint32_t value)
+{
+    const auto advance = [] {
+        g_gammaComponent = 0;
+        g_regFile[0x1922] = (g_regFile[0x1922] & ~0xFFu) | ((g_regFile[0x1922] + 1) & 0xFFu);
+    };
+    const uint32_t index = g_regFile[0x1922] & 0xFF, enable = g_regFile[0x1927] & 7;
+    const bool table = (g_regFile[0x1921] & 1) == 0;     // DC_LUT_RW_MODE: 256-entry table, not PWL
+    switch (reg)
+    {
+    case 0x1922:                                           // DC_LUT_RW_INDEX
+        g_gammaComponent = 0;
+        break;
+    case 0x1923:                                           // DC_LUT_SEQ_COLOR (red, green, blue)
+    {
+        if (!table) break;
+        const uint32_t shift = 20 - 10 * g_gammaComponent;
+        if (enable & (1u << (2 - g_gammaComponent)))
+        {
+            std::lock_guard<std::mutex> lock(g_gammaMutex);
+            uint32_t& e = GammaRamp()[index];
+            e = (e & ~(0x3FFu << shift)) | ((((value & 0xFFFF) >> 6) & 0x3FF) << shift);
+            g_gammaVersion.fetch_add(1);
+        }
+        if (++g_gammaComponent >= 3) advance();
+        break;
+    }
+    case 0x1924:                                           // DC_LUT_PWL_DATA: 2_10_10_10 front buffers only
+    {
+        static bool logged = false;
+        if (!logged) { logged = true; std::fprintf(stderr, "[gamma] PWL gamma ramp written (not applied: 8_8_8_8 front buffer)\n"); }
+        break;
+    }
+    case 0x1925:                                           // DC_LUT_30_COLOR
+    {
+        if (!table) break;
+        if (enable)
+        {
+            std::lock_guard<std::mutex> lock(g_gammaMutex);
+            uint32_t& e = GammaRamp()[index];
+            if (enable & 1) e = (e & ~0x3FFu) | (value & 0x3FFu);
+            if (enable & 2) e = (e & ~(0x3FFu << 10)) | (value & (0x3FFu << 10));
+            if (enable & 4) e = (e & ~(0x3FFu << 20)) | (value & (0x3FFu << 20));
+            g_gammaVersion.fetch_add(1);
+        }
+        advance();
+        break;
+    }
+    }
+}
+
+static void RaiseCpInterrupt(uint32_t cpuMask)
+{
+    uint32_t cb = g_intrCallback.load(), dev = g_intrContext.load();
+    if (!cb) return;
+    for (uint8_t cpu = 0; cpu < 6; ++cpu)
+    {
+        if (!(cpuMask & (1u << cpu))) continue;
+        GuestSetCurrentCpu(cpu);
+        GuestCall2(cb, 1, dev);        // source 1: the ISR calls [shadow+16]([shadow+20])
+    }
+    GuestSetCurrentCpu(0);
+    GpuProgress();
+}
+
+// Command-processor time split for TTT2_FRAMETIME=1 (CP thread only): WAIT_REG_MEM time by
+// kind (scratch-register handshakes such as the vblank token, other guest memory, registers),
+// and the remainder of ConsumeRing (executing packets) vs. the idle loop.
+struct CpTimes
+{
+    double waitMs[3] = {}, ringMs = 0, idleMs = 0;
+    uint64_t waits[3] = {};
+    std::unordered_map<uint32_t, std::pair<uint64_t, double>> memoryWaits;   // poll address -> count, ms
+};
+static CpTimes g_cpTimes;
+
+struct CpWaitClock
+{
+    int kind;
+    uint32_t address;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~CpWaitClock()
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        g_cpTimes.waitMs[kind] += ms;
+        ++g_cpTimes.waits[kind];
+        if (kind == 1 && FrameTimeLog())
+        {
+            auto& w = g_cpTimes.memoryWaits[address];
+            ++w.first;
+            w.second += ms;
+        }
+    }
+};
+
+// The game's swap sequence (VdSwap: an indirect buffer, then our marker) waits for the next vblank
+// on SCRATCH_REG1 (the vblank token: the previous flip done), then resolves frame N from EDRAM into
+// the front buffer: frame N is drawn when that wait starts. Resolve and present it then instead of
+// at its marker after the wait - MEASURED 2026-10-18: the wait lasted 7-8 ms every frame (the
+// console's flip at vblank), half a frame of input latency. The game's own resolve repeats the copy
+// and the flip bookkeeping still runs at the marker. Called when the wait starts and again while it
+// waits (the marker can be written a moment after the CP gets there; VdSwap wakes the wait).
+// Only while the previous frame resolved into this front buffer the same way. TTT2_EARLY_PRESENT=0:
+// present at the markers as before.
+static void TryEarlyPresent(uint32_t waitInfo, uint32_t pollOn)
+{
+    if (CpDiscarding()) return;
+    const uint32_t pending = g_cpMarkers + 1;
+    if (!EarlyPresentOn() || g_earlyBroken || !GpuHwMode() || !(waitInfo & 0x10) || (pollOn & ~3u) != g_regFile[0x01DD] + 4 ||
+        g_earlySwap == pending || pending > g_markerSwaps.load())
+        return;
+    const uint32_t fbSurf = g_markerFb[pending & 15].load();
+    if (!fbSurf || g_frontArgsAt + 1 != g_cpMarkers || g_frontArgs.dest != (fbSurf & ~0xFFFu)) return;
+    const FrontResolveArgs& a = g_frontArgs;
+    GpuHwResolve(a.key, a.dest, a.pitch, a.height, a.hasLatch, a.latch, a.swap, a.src, a.depthBase, a.depthFloat, a.format);
+    g_earlyArgs = a;
+    g_earlyMismatch = false;
+    g_frontBufferPhys.store(fbSurf & ~0xFFFu);
+    g_frontBufferSwizzle.store(fbSurf & 0xFFFu);
+    HwPresentFrame(g_frontBufferPhys.load());
+    g_earlySwap = pending;
+}
+
+// The command processor's work per frame (ms, average): from the end of one vblank-token wait (the
+// previous flip done) to the start of the next - the frame's draws. rollback.cpp uses it to judge
+// whether a rewind can wait for the frame in flight (GpuCpFrameMs).
+static std::atomic<double> g_cpFrameMs{ 4.0 };
+static std::chrono::steady_clock::time_point g_cpWaitEnd{};
+static bool IsVblankTokenWait(uint32_t waitInfo, uint32_t pollOn)
+{
+    return (waitInfo & 0x10) && (pollOn & ~3u) == g_regFile[0x01DD] + 4;
+}
+static void NoteCpFrameWork(uint32_t waitInfo, uint32_t pollOn, bool start)
+{
+    if (!IsVblankTokenWait(waitInfo, pollOn) || CpDiscarding()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (start)
+    {
+        if (g_cpWaitEnd.time_since_epoch().count())
+        {
+            const double ms = std::chrono::duration<double, std::milli>(now - g_cpWaitEnd).count();
+            if (ms < 100.0) g_cpFrameMs.store(g_cpFrameMs.load() * 0.95 + ms * 0.05);
+        }
+    }
+    else g_cpWaitEnd = now;
+}
+double GpuCpFrameMs() { return g_cpFrameMs.load(); }
+
+static bool CpWaitYield()
+{
+    static const bool yield = [] { const char* e = std::getenv("TTT2_CP_WAIT"); return e && std::strcmp(e, "yield") == 0; }();
+    return yield;
+}
+// TTT2_FRAMETIME=1: waits whose value turned up only after a 1 ms sleep ran out (written
+// without a GpuProgress bump), counted by address and printed every 600.
+static void CpWaitLateWake(uint32_t pollOn)
+{
+    static std::mutex m;
+    static std::unordered_map<uint32_t, uint32_t> counts;
+    static uint32_t total = 0;
+    if (!FrameTimeLog()) return;
+    std::lock_guard l(m);
+    ++counts[pollOn];
+    if (++total % 600 != 0) return;
+    char line[512];
+    int n = BoundedSnprintf(line, sizeof(line), "[frame] cp waits woken late (no progress bump), %u so far:", total);
+    for (const auto& [a, c] : counts)
+        if (n < 440) n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X=%u", a, c);
+    BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+    std::fputs(line, stderr);
+}
+
+// Wait until (value & mask) <func> ref, polling guest memory or the register file.
+static bool WaitRegMem(uint32_t waitInfo, uint32_t pollOn, uint32_t ref, uint32_t mask)
+{
+    struct TimingMark                                   // TTT2_INPUT_TIMING=1: the wait's span
+    {
+        uint32_t poll;
+        uint32_t info = 0;
+        double start = InputTimingOn() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+        ~TimingMark()
+        {
+            NoteCpFrameWork(info, poll, false);
+            if (InputTimingOn())
+                std::fprintf(stderr, "[cpwait] %08X from %.1f ms at %.1f ms\n", poll, start,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+    } timingMark{ pollOn, waitInfo };
+    if ((waitInfo & 0x10) && (CpDiscarding() || CpUnpaced())) return false;   // rollback: no vblank pacing
+    const CpWaitClock waitClock{ (waitInfo & 0x10) ? (pollOn < 0x1000 ? 0 : 1) : 2, pollOn };
+    const timeline::Scope waitMark{ timeline::CpVblankWait, pollOn };
+    bool memSpace = (waitInfo & 0x10) != 0;
+    uint32_t func = waitInfo & 0x7;
+    // Coherency waits: the stream programs COHER_BASE/SIZE_HOST and then waits for the GPU to
+    // acknowledge the cache flush by clearing bits of COHER_STATUS_HOST (0x0A31). We have no
+    // caches to flush - acknowledge immediately, the way Xenia's command processor does.
+    // Without this the audio-awakened resource-upload paths stalled 3 s per wait, 70+ times a
+    // run.
+    if (!memSpace && (pollOn & 0x7FFF) == 0x0A31)
+    {
+        g_regFile[0x0A31] &= ~mask;
+        GWrite32(g_base, 0x7FC80000u + 0x0A31u * 4, g_regFile[0x0A31]);
+        static int clog = 0;
+        if (clog < 6)
+        {
+            ++clog;
+            std::fprintf(stderr, "[vd] coherency ack: status &= ~%08X -> %08X\n",
+                         mask, g_regFile[0x0A31]);
+        }
+        return false;
+    }
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    // Throttle forensics: the SCRATCH_REG1 wait times out every frame even though the swap
+    // DPC provably consumes the vblank-fence token (q16976 == q17112). Log entry and exit of
+    // exactly that wait so the run shows what value it saw and for how long.
+    static std::atomic<int> wlog{ 200 };
+    bool traced = pollOn == 0x13EB4506u && wlog.fetch_sub(1) > 0;
+    uint32_t firstSeen = 0xDEADBEEF;
+    auto t0 = std::chrono::steady_clock::now();
+    bool timedOut = false;
+    for (uint64_t spins = 0;; ++spins)
+    {
+        const uint32_t progress = g_gpuProgress.load(std::memory_order_acquire);
+        if (memSpace && CpUnpaced()) return false;    // a rewind's drain started during this wait
+        if (memSpace && spins == 0) NoteCpFrameWork(waitInfo, pollOn, true);
+        if (memSpace) TryEarlyPresent(waitInfo, pollOn);
+        if (memSpace) SyncGuestScratchWrites();
+        uint32_t v;
+        if (memSpace && pollOn < 0x1000)
+        {
+            // Tiny "memory" addresses are byte offsets into the scratch-register memory
+            // shadow: the fence handshake waits on SCRATCH_REG[off/4]. Poll the SHADOW -
+            // the CP writes it via MirrorScratch and the guest ISR acks in it directly.
+            uint32_t shadow = ScratchShadow();
+            v = shadow ? GRead32(g_base, shadow + (pollOn & ~3u))
+                       : GRead32(g_base, 0x7FC80000u + (0x578u + ((pollOn & ~3u) >> 2)) * 4);
+        }
+        else if (memSpace)
+            v = GRead32(g_base, PhysToGuest(pollOn & ~3u));
+        else
+            v = pollOn < 0x8000 ? GRead32(g_base, 0x7FC80000u + pollOn * 4) : 0;
+        v &= mask;
+        if (traced && firstSeen == 0xDEADBEEF)
+        {
+            firstSeen = v;
+            std::fprintf(stderr, "[wrm] enter poll=%08X first=%08X\n", pollOn, v);
+        }
+        bool ok;
+        switch (func)
+        {
+        case 1: ok = v <  ref; break;
+        case 2: ok = v <= ref; break;
+        case 3: ok = v == ref; break;
+        case 4: ok = v != ref; break;
+        case 5: ok = v >= ref; break;
+        case 6: ok = v >  ref; break;
+        default: ok = true; break;
+        }
+        if (ok)
+        {
+            if (traced)
+            {
+                auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "[wrm] PASS poll=%08X first=%08X after %lld us\n",
+                             pollOn, firstSeen, (long long)us);
+            }
+            if (timedOut) CpWaitLateWake(pollOn);
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        if (CpWaitYield())
+        {
+            // TTT2_CP_WAIT=yield: the old loop - yield for up to a frame and a half (Windows
+            // sleep_for(500us) really costs ~15 ms), then 1 ms sleeps; real 3 s deadline.
+            if (spins < 20000 || now - t0 < std::chrono::milliseconds(25)) std::this_thread::yield();
+            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        // The values these waits poll (the vblank token, the fence handshake) are written by
+        // the vblank interrupt and the command stream, which bump GpuProgress: sleep on it
+        // instead of yielding. MEASURED 2026-10-15: the yield loop cost the CP thread ~250 ms/s
+        // of kernel calls in fights. A short pause-spin first catches an imminent write; the
+        // 1 ms cap bounds a write nobody announces (a guest store to the register aperture).
+        for (int i = 0; i < 200 && g_gpuProgress.load(std::memory_order_acquire) == progress; ++i) _mm_pause();
+        timedOut = !WaitGpuProgress(progress, 1);     // the last sleep ran out: no bump announced the write
+    }
+    uint32_t sh = ScratchShadow();
+    std::fprintf(stderr,
+        "[vd] WAIT_REG_MEM timeout: info=%X poll=%08X ref=%08X mask=%08X "
+        "shadow=%08X sh0=%08X sh4=%08X ap0=%08X ap4=%08X\n",
+        waitInfo, pollOn, ref, mask, sh,
+        sh ? GRead32(g_base, sh) : 0, sh ? GRead32(g_base, sh + 4) : 0,
+        GRead32(g_base, 0x7FC80000u + 0x578u * 4), GRead32(g_base, 0x7FC80000u + 0x579u * 4));
+    // Full scratch state: shadow dwords, aperture dwords, and the CP's cached copies. A wait
+    // on a scratch-shadow address that times out means one of the three disagrees about who
+    // wrote last - print all of them and the disagreement is visible directly.
+    if (sh)
+    {
+        char l3[300]; int n5 = 0;
+        n5 += BoundedSnprintf(l3 + n5, sizeof(l3) - n5, "[vd]   scratch sh:");
+        for (int i2 = 0; i2 < 8; ++i2)
+            n5 += BoundedSnprintf(l3 + n5, sizeof(l3) - n5, " %08X", GRead32(g_base, sh + i2 * 4));
+        n5 += BoundedSnprintf(l3 + n5, sizeof(l3) - n5, "  ap:");
+        for (int i2 = 0; i2 < 8; ++i2)
+            n5 += BoundedSnprintf(l3 + n5, sizeof(l3) - n5, " %08X",
+                                GRead32(g_base, 0x7FC80000u + (0x578u + i2) * 4));
+        n5 += BoundedSnprintf(l3 + n5, sizeof(l3) - n5, "  rf:");
+        for (int i2 = 0; i2 < 8; ++i2)
+            n5 += BoundedSnprintf(l3 + n5, sizeof(l3) - n5, " %08X", g_regFile[0x578 + i2]);
+        BoundedSnprintf(l3 + n5, sizeof(l3) - n5, "\n");
+        std::fputs(l3, stderr);
+    }
+    return true;
+}
+
+struct PacketHistoryEntry { uint32_t address, header, stream, size; int depth; };
+static PacketHistoryEntry g_packetHistory[64]{};
+static uint64_t g_packetSequence = 0;
+
+static uint32_t LatchImmediateShader(uint32_t stage, uint32_t source, uint32_t words)
+{
+    // IM_LOAD_IMMEDIATE uploads program bytes, it does not retain a pointer to
+    // the command buffer. Primary-ring staging and reusable IBs may change after
+    // this packet. The CP executes draws synchronously, so one buffer per stage
+    // lasts until that stage's next upload without interfering with the other.
+    static uint32_t programs[2]{};
+    constexpr uint32_t capacity = 0x10000;
+    if (!words || words > capacity / 4 || uint64_t(source) + words * 4ull > 0x100000000ull)
+    {
+        std::fprintf(stderr, "[pm4-fault] invalid immediate shader upload stage=%u source=%08X words=%u\n",
+                     stage, source, words);
+        std::fflush(stderr);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+        std::abort();
+    }
+    uint32_t& destination = programs[stage == 0 ? 0 : 1];
+    if (!destination)
+    {
+        void* allocation = g_virtualHeap.Alloc(capacity, 16);
+        if (!allocation)
+        {
+            std::fputs("[pm4-fault] cannot allocate shader program storage\n", stderr);
+            std::fflush(stderr);
+            LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+            std::abort();
+        }
+        destination = GuestAddr(g_base, allocation);
+    }
+    std::memcpy(g_base + destination, g_base + source, words * 4);
+    return destination;
+}
+
+static void CheckPacketBoundary(uint32_t address, uint32_t header, uint32_t start,
+                                uint32_t size, uint32_t payloadWords, int depth)
+{
+    g_packetHistory[g_packetSequence++ % 64] = {address, header, start, size, depth};
+    static const bool strict = std::getenv("TTT2_STRICT_GPU") != nullptr;
+    bool overflow = uint64_t(address - start) + 4 + uint64_t(payloadWords) * 4 > size;
+    uint32_t op = (header >> 8) & 0x7F;
+    bool invalidOpcode = strict && (header >> 30) == 3 && (op == 0 || op == 0x7F);
+    if (!overflow && !invalidOpcode) return;
+    std::fprintf(stderr, "[pm4-fault] %s @%08X h=%08X payload=%u stream=%08X+%X d=%d\n",
+                 overflow ? "packet exceeds stream" : "invalid opcode", address, header,
+                 payloadWords, start, size, depth);
+    for (uint64_t i = g_packetSequence > 64 ? g_packetSequence - 64 : 0;
+         i < g_packetSequence; ++i)
+    {
+        const auto& p = g_packetHistory[i % 64];
+        std::fprintf(stderr, "[pm4-history] #%llu d%d @%08X h=%08X stream=%08X+%X\n",
+                     (unsigned long long)i, p.depth, p.address, p.header, p.stream, p.size);
+    }
+    uint32_t first = address - start >= 64 ? address - 64 : start;
+    uint64_t limit = std::min<uint64_t>(uint64_t(address) + 96, uint64_t(start) + size);
+    for (uint64_t p = first; p + 16 <= limit; p += 16)
+        std::fprintf(stderr, "[pm4-bytes] %08X: %08X %08X %08X %08X\n", uint32_t(p),
+                     GRead32(g_base, uint32_t(p)), GRead32(g_base, uint32_t(p + 4)),
+                     GRead32(g_base, uint32_t(p + 8)), GRead32(g_base, uint32_t(p + 12)));
+    std::fflush(stderr);
+    LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+    std::abort();
+}
+
+// TTT2_CP_PROFILE=1 (diagnostics): where the command processor's time goes, per type-3 opcode
+// (inclusive of what the opcode calls; INDIRECT_BUFFER itself not counted, its packets are), and the
+// swap marker; printed every 600 swaps as ms per frame and us per packet.
+static bool CpProfileOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_CP_PROFILE"); return e && *e == '1'; }();
+    return on;
+}
+static int64_t g_cpOpTicks[129] = {};
+static uint64_t g_cpOpCount[129] = {};
+static int64_t CpQpc() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+struct CpOpTimer
+{
+    int op; int64_t t0;
+    explicit CpOpTimer(int o) : op(o), t0(CpProfileOn() && o >= 0 ? CpQpc() : 0) {}
+    ~CpOpTimer() { if (t0) { g_cpOpTicks[op] += CpQpc() - t0; ++g_cpOpCount[op]; } }
+};
+static void CpProfileReport()
+{
+    static uint32_t swaps = 0;
+    if (!CpProfileOn() || ++swaps % 600 != 0) return;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    std::vector<std::pair<int64_t, int>> order;
+    int64_t total = 0;
+    for (int i = 0; i < 129; ++i) if (g_cpOpCount[i]) { order.push_back({ g_cpOpTicks[i], i }); total += g_cpOpTicks[i]; }
+    std::sort(order.rbegin(), order.rend());
+    char line[1024];
+    int n = std::snprintf(line, sizeof(line), "[cp-profile] %.2f ms per frame in packets:", double(total) * 1000.0 / double(f.QuadPart) / 600.0);
+    for (size_t k = 0; k < order.size() && k < 12 && n < 900; ++k)
+    {
+        const int i = order[k].second;
+        n += std::snprintf(line + n, sizeof(line) - n, " %s%02X=%.2fms(%llu/f,%.1fus)", i == 128 ? "swap" : "op", i == 128 ? 0 : i,
+                           double(g_cpOpTicks[i]) * 1000.0 / double(f.QuadPart) / 600.0, (unsigned long long)(g_cpOpCount[i] / 600),
+                           double(g_cpOpTicks[i]) * 1e6 / double(f.QuadPart) / double(g_cpOpCount[i]));
+    }
+    std::fprintf(stderr, "%s\n", line);
+    std::memset(g_cpOpTicks, 0, sizeof(g_cpOpTicks));
+    std::memset(g_cpOpCount, 0, sizeof(g_cpOpCount));
+}
+
+// ---- TTT2_RB_GPUMEM=1 (diagnostics): guest memory the command processor touches per frame -----------
+// Kinds: 0 command buffers (indirect buffers), 1 vertex data, 2 index data, 3 constant loads, 4 writes
+// (fences, MEM_WRITE, swap identifiers). Per frame (swap marker to swap marker) the distinct pages of each
+// kind and how many rollback.cpp rewinds (RollbackPageRewound); every 600 frames a summary with the
+// rewound pages' address ranges.
+bool RollbackPageRewound(uint32_t page);   // rollback.cpp: in the hot set, not masked whole
+static bool GpuMemOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_RB_GPUMEM"); return e && *e == '1'; }();
+    return on;
+}
+namespace gpumem {
+constexpr int kKinds = 6;
+const char* const kNames[kKinds] = { "command buffers", "vertex data", "index data", "constant loads", "CP writes", "texture data" };
+std::mutex m;
+std::vector<uint32_t> epoch[kKinds];      // page -> frame number + 1 it was last counted in
+std::vector<uint32_t> pages[kKinds];      // this frame's distinct pages
+uint32_t frame = 0;
+uint64_t totalPages[kKinds] = {}, rewoundPages[kKinds] = {}, frames = 0;
+std::map<uint32_t, uint32_t> rewoundRuns[kKinds];   // first page of a 1 MB block -> times seen rewound
+std::vector<uint32_t> lastPages[kKinds];             // the last finished frame's pages
+// Rewind measurement: the last frame's pages and their hashes at the rewind's start.
+std::vector<std::pair<uint32_t, uint64_t>> rewindHashes[kKinds];
+uint64_t rewinds = 0, rewindPages[kKinds] = {}, rewindChanged[kKinds] = {};
+std::map<uint32_t, uint32_t> changedRuns[kKinds];   // 1 MB block -> pages seen changed
+std::set<uint32_t> changedOutsideRing;               // vertex pages outside the skinned ring, a few
+std::map<int, uint32_t> scratchAges;                 // changed scratch pages by age (rewinds)
+uint64_t changedAt[2][kKinds] = {};                  // changed after the restore / after the first update
+uint64_t HashPage(uint32_t page)
+{
+    const uint64_t* p = reinterpret_cast<const uint64_t*>(g_base + (uint64_t(page) << 12));
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 512; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+}
+static void GpuMemRingReadCheck(uint32_t firstPage, uint32_t endPage);   // p_diag52, below
+namespace frame_overlap {
+void NoteRead(int kind, uint32_t addr, uint32_t bytes);
+void MarkCpThread();
+uint64_t KickCount();
+bool KickWouldOverlap();
+bool WouldGuard(uint32_t page, uint64_t kick);
+bool InRound(uint32_t battleState);
+const uint8_t* CpReadBegin(uint32_t addr, uint32_t bytes, std::vector<uint8_t>& scratch);
+void CpReadEnd();
+}   // frame_overlap.cpp
+void GpuNoteMemory(int kind, uint32_t addr, uint32_t bytes)
+{
+    frame_overlap::NoteRead(kind, addr, bytes);        // the frame overlap's write guard learns what frames read
+    if (!GpuMemOn() || !bytes || kind < 0 || kind >= gpumem::kKinds) return;
+    if (kind == 1) GpuMemRingReadCheck(addr >> 12, uint32_t((uint64_t(addr) + bytes + 4095) >> 12));
+    std::lock_guard l(gpumem::m);
+    auto& ep = gpumem::epoch[kind];
+    if (ep.empty()) ep.assign(1u << 20, 0);
+    for (uint64_t p = addr >> 12, e = (uint64_t(addr) + bytes + 4095) >> 12; p < e && p < ep.size(); ++p)
+        if (ep[p] != gpumem::frame + 1) { ep[p] = gpumem::frame + 1; gpumem::pages[kind].push_back(uint32_t(p)); }
+}
+static void GpuMemFrameEnd()
+{
+    if (!GpuMemOn()) return;
+    std::lock_guard l(gpumem::m);
+    for (int k = 0; k < gpumem::kKinds; ++k)
+    {
+        for (uint32_t p : gpumem::pages[k])
+        {
+            ++gpumem::totalPages[k];
+            if (RollbackPageRewound(p)) { ++gpumem::rewoundPages[k]; ++gpumem::rewoundRuns[k][p >> 8]; }
+        }
+        gpumem::lastPages[k].swap(gpumem::pages[k]);
+        gpumem::pages[k].clear();
+    }
+    ++gpumem::frame;
+    if (++gpumem::frames % 600 != 0) return;
+    for (int k = 0; k < gpumem::kKinds; ++k)
+    {
+        char line[700];
+        int n = std::snprintf(line, sizeof(line), "[gpu-mem] %s: %.1f pages a frame, %.1f of them rewound; rewound in 1 MB blocks:", gpumem::kNames[k],
+                              double(gpumem::totalPages[k]) / 600.0, double(gpumem::rewoundPages[k]) / 600.0);
+        int shown = 0;
+        for (const auto& [blk, c] : gpumem::rewoundRuns[k])
+            if (shown++ < 12 && n < 600) n += std::snprintf(line + n, sizeof(line) - n, " %08X(%u)", blk << 20, c);
+        std::fprintf(stderr, "%s\n", line);
+        gpumem::totalPages[k] = gpumem::rewoundPages[k] = 0;
+        gpumem::rewoundRuns[k].clear();
+    }
+}
+
+// rollback.cpp's session rewind: after the drain (the frame that was in flight is the last finished one)
+// and after the re-simulation - which of that frame's pages changed in between, by kind; a summary every
+// 50 rewinds with the 1 MB blocks the changed pages lie in.
+void GpuMemRewindBegin()
+{
+    if (!GpuMemOn()) return;
+    std::lock_guard l(gpumem::m);
+    for (int k = 0; k < gpumem::kKinds; ++k)
+    {
+        gpumem::rewindHashes[k].clear();
+        for (uint32_t p : gpumem::lastPages[k]) gpumem::rewindHashes[k].emplace_back(p, gpumem::HashPage(p));
+    }
+}
+// stage 0: after the restore; 1: after the first re-simulated update (before its draw).
+void GpuMemRewindCheck(int stage)
+{
+    if (!GpuMemOn() || stage < 0 || stage > 1) return;
+    std::lock_guard l(gpumem::m);
+    for (int k = 0; k < gpumem::kKinds; ++k)
+        for (const auto& [p, h] : gpumem::rewindHashes[k])
+            if (gpumem::HashPage(p) != h) ++gpumem::changedAt[stage][k];
+}
+void GpuMemRewindEnd()
+{
+    if (!GpuMemOn()) return;
+    std::lock_guard l(gpumem::m);
+    ++gpumem::rewinds;
+    for (int k = 0; k < gpumem::kKinds; ++k)
+        for (const auto& [p, h] : gpumem::rewindHashes[k])
+        {
+            ++gpumem::rewindPages[k];
+            if (gpumem::HashPage(p) != h)
+            {
+                ++gpumem::rewindChanged[k]; ++gpumem::changedRuns[k][p >> 8];
+                if (k == 1 && (p < 0xA0000 || p >= 0xA2200) && gpumem::changedOutsideRing.size() < 16) gpumem::changedOutsideRing.insert(p);
+                extern int ResimScratchPageAge(uint32_t page);
+                if (const int age = ResimScratchPageAge(p); age >= 0) ++gpumem::scratchAges[age];
+            }
+        }
+    if (gpumem::rewinds % 50 != 0) return;
+    for (int k = 0; k < gpumem::kKinds; ++k)
+    {
+        char line[700];
+        int n = std::snprintf(line, sizeof(line), "[gpu-mem] rewinds: %s of the frame in flight: %.1f pages, %.1f changed by the re-simulation; in 1 MB blocks:",
+                              gpumem::kNames[k], double(gpumem::rewindPages[k]) / 50.0, double(gpumem::rewindChanged[k]) / 50.0);
+        int shown = 0;
+        for (const auto& [blk, c] : gpumem::changedRuns[k])
+            if (shown++ < 12 && n < 600) n += std::snprintf(line + n, sizeof(line) - n, " %08X(%u)", blk << 20, c);
+        std::fprintf(stderr, "%s (after the restore %.1f, after the first update %.1f)\n", line,
+                     double(gpumem::changedAt[0][k]) / 50.0, double(gpumem::changedAt[1][k]) / 50.0);
+        gpumem::rewindPages[k] = gpumem::rewindChanged[k] = 0;
+        gpumem::changedAt[0][k] = gpumem::changedAt[1][k] = 0;
+        gpumem::changedRuns[k].clear();
+    }
+    std::string pages;
+    char b[16];
+    for (uint32_t p : gpumem::changedOutsideRing) { std::snprintf(b, sizeof(b), " %08X", p << 12); pages += b; }
+    std::fprintf(stderr, "[gpu-mem] rewinds: vertex pages changed outside the skinned ring:%s\n", pages.c_str());
+    std::string ages;
+    for (const auto& [age, n] : gpumem::scratchAges) { std::snprintf(b, sizeof(b), " %d:%u", age, n); ages += b; }
+    if (!ages.empty()) std::fprintf(stderr, "[gpu-mem] rewinds: changed scratch pages by age in rewinds (age:pages):%s\n", ages.c_str());
+}
+
+// p_diag48 (TTT2_RB_GPUMEM=1, diagnostics): would the frame kick's wait for an idle GPU (diag_hooks.cpp sub_82AD1DE8)
+// be safe to shorten to the previous frame? Right after the wait returns (the command processor has run every draw of
+// this frame), the pages those draws read are hashed; at the next kick, before its wait, they are hashed again: a page
+// that changed was written by the game during the next frame's work - what a command processor one frame behind would
+// have read wrong. Every 300 kicks: pages checked and changed per kick by kind, and the 1 MB blocks of the changes.
+namespace gpumem {
+std::vector<std::pair<uint32_t, uint64_t>> kickHashes[kKinds];
+uint64_t kickChecks = 0, kickPages[kKinds] = {}, kickChanged[kKinds] = {};
+std::map<uint32_t, uint32_t> kickRuns[kKinds];
+bool kickArmed = false;
+// p_diag53: TTT2_RB_GPUMEM_ROUNDS=1 counts only kicks released in a round (battle state 82EAC03C == 4: where frames
+// may overlap); the release's state, and the first changed pages of each kind (by address) in each summary.
+uint32_t kickState = 0;
+uint64_t kickSkipped = 0;
+// p_diag54 (TTT2_FRAME_OVERLAP=check): pages read by a kick that would have overlapped, changed before the next
+// kick, which the frame overlap's write guard would not have protected yet - what an overlapped frame could draw wrong.
+uint64_t kickOverlapIndex = 0;
+bool kickWouldOverlap = false;
+uint64_t unguardedKicks = 0;
+std::map<uint32_t, uint32_t> unguardedPages;
+std::map<uint32_t, uint32_t> kickPagesChanged[kKinds];
+bool RoundsOnly() { static const bool on = [] { const char* e = std::getenv("TTT2_RB_GPUMEM_ROUNDS"); return e && *e == '1'; }(); return on; }
+// The skinned-vertex ring (82E40580: +4 region size, +8.. bases, +20 index, +68 regions): its index at the release,
+// the regions of the read and the changed vertex pages relative to it, and how far the index moved by the check.
+uint32_t kickRingIndex = 0;
+uint64_t ringRead[4] = {}, ringChanged[4] = {}, ringMoves[4] = {};
+int RingRegion(uint32_t page)
+{
+    const uint32_t ring = 0x82E40580u, n = GRead32(g_base, ring + 68), size = GRead32(g_base, ring + 4), a = page << 12;
+    for (uint32_t i = 0; i < n && i < 8; ++i)
+    {
+        const uint32_t b = GRead32(g_base, ring + 8 + 4 * i) & ~0xFFFu;
+        if (a >= b && a < b + size + 0x1000) return int(i);
+    }
+    return -1;
+}
+int RingRelative(uint32_t page)
+{
+    const int r = RingRegion(page);
+    const uint32_t n = GRead32(g_base, 0x82E40580u + 68);
+    return r < 0 || !n ? 3 : int((uint32_t(r) + n - kickRingIndex % n) % n);
+}
+}
+// p_diag52: vertex data the command processor reads from the skinning region the game writes now (the ring's current
+// slot) - never, if a frame's draws read only the two regions before it (with the frames overlapped too). Counted per
+// 300 kicks in the "next frame" summary.
+std::atomic<uint64_t> g_cpCurrentRegionReads{ 0 }, g_cpRingReads{ 0 };
+static void GpuMemRingReadCheck(uint32_t firstPage, uint32_t endPage)
+{
+    const uint32_t ring = 0x82E40580u, index = GRead32(g_base, ring + 20), size = GRead32(g_base, ring + 4);
+    if (index >= 3 || !size) return;
+    const uint32_t cur = GRead32(g_base, ring + 8 + 4 * index) >> 12, end = cur + ((size + 4095) >> 12);
+    bool inRing = false;
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        const uint32_t b = GRead32(g_base, ring + 8 + 4 * i) >> 12;
+        if (firstPage < b + ((size + 4095) >> 12) && endPage > b) inRing = true;
+    }
+    if (!inRing) return;
+    g_cpRingReads.fetch_add(1, std::memory_order_relaxed);
+    if (firstPage < end && endPage > cur) g_cpCurrentRegionReads.fetch_add(1, std::memory_order_relaxed);
+}
+void GpuMemKickRelease()
+{
+    if (!GpuMemOn()) return;
+    std::lock_guard l(gpumem::m);
+    for (int k = 0; k < gpumem::kKinds; ++k)
+    {
+        gpumem::kickHashes[k].clear();
+        if (k == 4) continue;                                   // the command processor's own writes
+        for (uint32_t p : gpumem::pages[k]) gpumem::kickHashes[k].emplace_back(p, gpumem::HashPage(p));
+    }
+    gpumem::kickRingIndex = GRead32(g_base, 0x82E40580u + 20);
+    gpumem::kickState = GRead32(g_base, 0x82EAC03Cu);
+    gpumem::kickOverlapIndex = frame_overlap::KickCount();
+    gpumem::kickWouldOverlap = frame_overlap::KickWouldOverlap();
+    gpumem::kickArmed = true;
+}
+void GpuMemKickCheck()
+{
+    if (!GpuMemOn()) return;
+    std::lock_guard l(gpumem::m);
+    if (!gpumem::kickArmed) return;
+    gpumem::kickArmed = false;
+    if (gpumem::RoundsOnly() && !frame_overlap::InRound(gpumem::kickState)) { ++gpumem::kickSkipped; return; }
+    ++gpumem::kickChecks;
+    for (int k = 0; k < gpumem::kKinds; ++k)
+        for (const auto& [p, h] : gpumem::kickHashes[k])
+        {
+            ++gpumem::kickPages[k];
+            const bool changed = gpumem::HashPage(p) != h;
+            if (changed) { ++gpumem::kickChanged[k]; ++gpumem::kickRuns[k][p >> 8]; }
+            if (changed && (k != 1 || gpumem::RingRelative(p) == 3)) ++gpumem::kickPagesChanged[k][p];
+            if (changed && gpumem::kickWouldOverlap && k >= 1 && k <= 3 && !(k == 1 && gpumem::RingRelative(p) != 3)
+                && !frame_overlap::WouldGuard(p, gpumem::kickOverlapIndex))
+            {
+                ++gpumem::unguardedPages[p | uint32_t(k) << 24];
+                static int logs = 0;                              // p_diag62 TEST ONLY: which kick
+                if (logs < 300)
+                {
+                    ++logs;
+                    std::fprintf(stderr, "[gpu-mem] overlap check: kick %llu read %08X (kind %d), changed before the next kick, unguarded\n",
+                                 (unsigned long long)gpumem::kickOverlapIndex, p << 12, k);
+                }
+            }
+            if (k == 1) { const int rel = gpumem::RingRelative(p); ++gpumem::ringRead[rel]; if (changed) ++gpumem::ringChanged[rel]; }
+        }
+    {
+        const uint32_t n = GRead32(g_base, 0x82E40580u + 68), now = GRead32(g_base, 0x82E40580u + 20);
+        ++gpumem::ringMoves[n ? (now + n - gpumem::kickRingIndex % n) % n : 3];
+    }
+    if (gpumem::kickChecks % 300 == 0)
+    {
+        if (gpumem::RoundsOnly())
+            std::fprintf(stderr, "[gpu-mem] next frame: 300 kicks in rounds (battle state 4; %llu others since the last summary)\n",
+                         (unsigned long long)std::exchange(gpumem::kickSkipped, 0));
+        {
+            char line[900];
+            int n = std::snprintf(line, sizeof(line), "[gpu-mem] overlap check: %zu changed pages the write guard would not have protected (page(times)):",
+                                  gpumem::unguardedPages.size());
+            int shown = 0;
+            for (const auto& [pg, c] : gpumem::unguardedPages)
+                if (shown++ < 24 && n < 800) n += std::snprintf(line + n, sizeof(line) - n, " %08X(%u%c)", (pg & 0xFFFFFu) << 12, c, "?vic"[(pg >> 24) & 3]);
+            std::fprintf(stderr, "%s\n", line);
+            gpumem::unguardedPages.clear();
+        }
+        std::fprintf(stderr, "[gpu-mem] next frame: skinned ring, region relative to the index at the release (0 = the same, 1 = next, 2 = the one after, "
+                             "3 = outside): read %llu/%llu/%llu/%llu, changed %llu/%llu/%llu/%llu; index moved by the next kick 0:%llu 1:%llu 2:%llu\n",
+                     (unsigned long long)gpumem::ringRead[0], (unsigned long long)gpumem::ringRead[1], (unsigned long long)gpumem::ringRead[2],
+                     (unsigned long long)gpumem::ringRead[3], (unsigned long long)gpumem::ringChanged[0], (unsigned long long)gpumem::ringChanged[1],
+                     (unsigned long long)gpumem::ringChanged[2], (unsigned long long)gpumem::ringChanged[3],
+                     (unsigned long long)gpumem::ringMoves[0], (unsigned long long)gpumem::ringMoves[1], (unsigned long long)gpumem::ringMoves[2]);
+        for (int i = 0; i < 4; ++i) gpumem::ringRead[i] = gpumem::ringChanged[i] = gpumem::ringMoves[i] = 0;
+        std::fprintf(stderr, "[gpu-mem] command processor: %llu vertex reads in the skinning ring, %llu of them in the region the game writes now\n",
+                     (unsigned long long)g_cpRingReads.exchange(0), (unsigned long long)g_cpCurrentRegionReads.exchange(0));
+    }
+    if (gpumem::kickChecks % 300 != 0) return;
+    for (int k = 0; k < gpumem::kKinds; ++k)
+    {
+        if (k == 4) continue;
+        char line[900];
+        int n = std::snprintf(line, sizeof(line), "[gpu-mem] next frame: %s read by a frame's draws: %.1f pages, %.2f changed before the next kick; in 1 MB blocks:",
+                              gpumem::kNames[k], double(gpumem::kickPages[k]) / 300.0, double(gpumem::kickChanged[k]) / 300.0);
+        int shown = 0;
+        for (const auto& [blk, c] : gpumem::kickRuns[k])
+            if (shown++ < 16 && n < 800) n += std::snprintf(line + n, sizeof(line) - n, " %08X(%u)", blk << 20, c);
+        std::fprintf(stderr, "%s\n", line);
+        if (!gpumem::kickPagesChanged[k].empty())
+        {
+            n = std::snprintf(line, sizeof(line), "[gpu-mem] next frame: %s pages changed (outside the skinning ring; times):", gpumem::kNames[k]);
+            shown = 0;
+            for (const auto& [pg, c] : gpumem::kickPagesChanged[k])
+                if (shown++ < 24 && n < 800) n += std::snprintf(line + n, sizeof(line) - n, " %08X(%u)", pg << 12, c);
+            std::fprintf(stderr, "%s%s\n", line, gpumem::kickPagesChanged[k].size() > 24 ? " ..." : "");
+            gpumem::kickPagesChanged[k].clear();
+        }
+        gpumem::kickPages[k] = gpumem::kickChanged[k] = 0;
+        gpumem::kickRuns[k].clear();
+    }
+}
+
+static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
+{
+    if (depth > 4 || !addr) return;
+    if (depth > 0) GpuNoteMemory(0, addr, sizeBytes);
+    struct IbMark
+    {
+        bool on; uint32_t v;
+        IbMark(bool o, uint32_t size) : on(o), v(size) { if (on) timeline::Mark(timeline::CpIb, '+', v); }
+        ~IbMark() { if (on) timeline::Mark(timeline::CpIb, '-', v); }
+    } ibMark{ depth > 0, sizeBytes };
+    if (uint64_t(addr) + sizeBytes > UINT32_MAX || ((addr | sizeBytes) & 3))
+    {
+        std::fprintf(stderr, "[pm4-fault] invalid stream range %08X+%X d=%d\n",
+                     addr, sizeBytes, depth);
+        std::fflush(stderr);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+        std::abort();
+    }
+    uint32_t start = addr;
+    uint32_t end = addr + sizeBytes;
+    while (uint64_t(addr) + 4 <= end)
+    {
+        uint32_t h = GRead32(g_base, addr); addr += 4;
+        uint32_t type = h >> 30;
+        uint32_t payload = GpuPacketBytes(h) / 4 - 1;
+        CheckPacketBoundary(addr - 4, h, start, sizeBytes, payload, depth);
+        if (h == 0) continue;                                    // zero padding between packets
+        if (h == 0x54535750u)                                    // 'TSWP': our VdSwap marker
+        {
+            const CpOpTimer swapTimer{ 128 };
+            CpProfileReport();
+            uint32_t identVal  = GRead32(g_base, addr);
+            uint32_t identAddr = GRead32(g_base, addr + 4);
+            uint32_t fbtex     = GRead32(g_base, addr + 8);
+            uint32_t fbSurf    = GRead32(g_base, addr + 12);
+            addr += 16;
+            // Swap-packet side effects: report the identifier, then enqueue the flip in the
+            // device's swap queue (16 x {fbAddr, dueTick} at dev+16980) - the game's own
+            // 60Hz swap DPC (sub_827404E0) drains it and performs the flip bookkeeping.
+            if (identAddr) { GWrite32(g_base, identAddr, identVal); GpuNoteMemory(4, identAddr, 4); }
+            GpuMemFrameEnd();
+            // The flip-queue enqueue that used to live here is GONE, and stays gone: with
+            // the VdGlobalDevice import slots fixed, the game's own ISR swap callback
+            // (sub_82740610) enqueues the flip and the SCRATCH_REG1 vblank-fence entries
+            // itself, under its own spinlock, with its own pacing. Our synthetic entries
+            // double-enqueued every flip and cleared the throttle flag at the wrong times.
+            // Only the identifier write above and the present-surface latch below remain.
+            // The surface was decoded in VdSwap (see there); a zero here just means this
+            // flip carried no usable fetch block, so keep showing the previous surface.
+            const bool discarded = CpDiscarding();
+            if (fbSurf && !discarded)
+            {
+                g_frontBufferPhys.store(fbSurf & ~0xFFFu);
+                g_frontBufferSwizzle.store(fbSurf & 0xFFFu);
+            }
+            ++g_cpMarkers;
+            CpRetireAfterUnpaced();
+            const bool early = g_earlySwap && g_earlySwap == g_cpMarkers && !g_earlyMismatch;
+            g_earlyMismatch = false;
+            if (early && !g_earlyBroken && g_markerFb[g_cpMarkers & 15].load() != fbSurf)
+            {
+                g_earlyBroken = true;                            // numbering lost: present at markers
+                std::fprintf(stderr, "[vd] early present off: marker %u surface %08X, recorded %08X\n",
+                             g_cpMarkers, fbSurf, g_markerFb[g_cpMarkers & 15].load());
+            }
+            if (GpuHwMode() && !early && !discarded) HwPresentFrame(g_frontBufferPhys.load());
+            FrameLogSwap();
+            PhysMirrorInvalidateAll();                           // frame boundary
+            static int slog = 0;
+            if (slog < 8)
+            {
+                ++slog;
+                std::fprintf(stderr, "[vd] swap-exec ident[%08X]=%08X fb=%08X\n",
+                             identAddr, identVal, fbtex);
+            }
+            continue;
+        }
+        if (type == 3)
+        {
+            uint32_t cnt = ((h >> 16) & 0x3FFF) + 1;
+            uint32_t op = (h >> 8) & 0x7F;
+            if (op < 128) ++g_opcodeSeen[op];
+            const CpOpTimer opTimer{ (op == 0x3F || op == 0x37) ? -1 : int(op) };
+            if (g_pm4Trace > 0)
+            {
+                --g_pm4Trace;
+                char line[300]; int n = 0;
+                n += BoundedSnprintf(line + n, sizeof(line) - n,
+                                   "[pm4] d%d @%08X h=%08X T3 op=%02X cnt=%-4u :", depth,
+                                   addr - 4, h, op, cnt);
+                for (uint32_t i = 0; i < cnt && i < 10; ++i)
+                    n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X",
+                                       GRead32(g_base, addr + i * 4));
+                if (cnt > 10) n += BoundedSnprintf(line + n, sizeof(line) - n, " ...");
+                BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+                std::fputs(line, stderr);
+            }
+            // Draw-state inventory (GPU phase bring-up): dump draw-class packets with the
+            // register state they depend on, so the host renderer is built from measured
+            // data, not guesses. First 48 draws only.
+            if (op == 0x2B && cnt >= 3)                          // IM_LOAD_IMMEDIATE (shader ucode)
+            {
+                // dword0 = shader type (0 = vertex, 1 = pixel), dword1 = start(31:16) |
+                // size-in-dwords(15:0), then the ucode itself.
+                uint32_t stype = GRead32(g_base, addr);
+                uint32_t startSize = GRead32(g_base, addr + 4);
+                uint32_t szDw = startSize & 0xFFFF;
+                if (!szDw || szDw > cnt - 2) szDw = cnt - 2;
+                const uint32_t program = LatchImmediateShader(stype, addr + 8, szDw);
+                if (stype == 0) { g_curVs = program; g_curVsSize = szDw; }
+                else            { g_curPs = program; g_curPsSize = szDw; }
+                DumpShaderBlob(stype, program, szDw);
+                static int imlog = 0;
+                if (imlog < 24)
+                {
+                    ++imlog;
+                    std::fprintf(stderr, "[gpu] IM_LOAD_IMM type=%u startSize=%08X cnt=%u -> %u dw @%08X\n",
+                                 stype, startSize, cnt, szDw, addr + 8);
+                }
+            }
+            else if (op == 0x27 && cnt >= 2)                     // IM_LOAD (ucode from memory)
+            {
+                uint32_t d0 = GRead32(g_base, addr), d1 = GRead32(g_base, addr + 4);
+                uint32_t stype = d0 & 3, src = PhysToGuest(d0 & ~3u), szDw = d1 & 0xFFFF;
+                if (stype == 0) { g_curVs = src; g_curVsSize = szDw; }
+                else            { g_curPs = src; g_curPsSize = szDw; }
+                static int imlog2 = 0;
+                if (imlog2 < 24)
+                {
+                    ++imlog2;
+                    std::fprintf(stderr, "[gpu] IM_LOAD type=%u src=%08X startSize=%08X -> %u dw\n",
+                                 stype, src, d1, szDw);
+                }
+                if (szDw && szDw < 4096) DumpShaderBlob(stype, src, szDw);
+            }
+            else if (op == 0x46 && cnt >= 1)                     // EVENT_WRITE: latch event id
+            {
+                g_regFile[0x21F9] = GRead32(g_base, addr) & 0x3F;
+            }
+            else if ((op == 0x2D || op == 0x55 || op == 0x56) && cnt >= 1)
+            {
+                // SET_CONSTANT (0x2D): dword0 = index(10:0) | bank(23:16); the bank selects
+                // the register-file base (0 ALU 0x4000, 1 FETCH 0x4800, 2 BOOL 0x4900,
+                // 3 LOOP 0x4908, 4 context registers 0x2000).
+                // SET_CONSTANT2 (0x55) / SET_SHADER_CONSTANTS (0x56): dword0 is already an
+                // absolute register-file index.
+                uint32_t d0 = GRead32(g_base, addr), reg;
+                if (op == 0x2D)
+                {
+                    uint32_t bank = (d0 >> 16) & 0xFF, idx = d0 & 0x7FF;
+                    static const uint32_t base[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+                    reg = (bank < 5 ? base[bank] : 0x2000) + idx;
+                }
+                else reg = d0 & 0xFFFF;
+                for (uint32_t i = 1; i < cnt; ++i)
+                    WriteReg(reg + i - 1, GRead32(g_base, addr + i * 4));
+                static int sclog = 0;
+                if (sclog < 40)
+                {
+                    ++sclog;
+                    std::fprintf(stderr, "[gpu] SET_CONST op=%02X d0=%08X -> reg %04X x%u\n",
+                                 op, d0, reg, cnt - 1);
+                }
+            }
+            else if (op == 0x2F && cnt >= 3)                     // LOAD_ALU_CONSTANT (from memory)
+            {
+                uint32_t src = PhysToGuest(GRead32(g_base, addr) & 0x3FFFFFFCu);
+                uint32_t ot  = GRead32(g_base, addr + 4);
+                uint32_t n   = GRead32(g_base, addr + 8) & 0xFFF;
+                uint32_t bank = (ot >> 16) & 0xFF, idx = ot & 0x7FF;
+                GpuNoteMemory(3, src, n * 4);
+                {
+                    extern bool PoisonOn();                                                         // TEST ONLY (p_diag35)
+                    extern void PoisonScan(const char* kind, uint32_t addr, uint32_t bytes, uint64_t a, uint64_t b);
+                    if (PoisonOn()) PoisonScan("alu-constants", src, n * 4, ot, n);
+                }
+                static const uint32_t base[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+                uint32_t reg = (bank < 5 ? base[bank] : 0x2000) + idx;
+                {
+                    // As the frame drawn sees them (the frame overlap's copies of pages the game wrote since).
+                    thread_local std::vector<uint8_t> overlapScratch;
+                    const uint32_t m = std::min<uint32_t>(n, 4096);
+                    const uint8_t* cs = frame_overlap::CpReadBegin(src, m * 4, overlapScratch);
+                    for (uint32_t i = 0; i < m; ++i)
+                    {
+                        uint32_t w;
+                        std::memcpy(&w, cs + i * 4, 4);
+                        WriteReg(reg + i, __builtin_bswap32(w));
+                    }
+                    frame_overlap::CpReadEnd();
+                }
+                static int lalog = 0;
+                if (lalog < 20)
+                {
+                    ++lalog;
+                    std::fprintf(stderr, "[gpu] LOAD_ALU_CONST src=%08X ot=%08X n=%u -> reg %04X\n",
+                                 src, ot, n, reg);
+                }
+            }
+            else if (op == 0x45 && cnt >= 6)                     // COND_WRITE
+            {
+                // Log-only for now (enabling the write is TTT2_CONDWRITE=1): the stream emits
+                // 256 of these and we must know what they target before letting them fire.
+                uint32_t info = GRead32(g_base, addr);
+                uint32_t poll = GRead32(g_base, addr + 4), ref = GRead32(g_base, addr + 8);
+                uint32_t mask = GRead32(g_base, addr + 12);
+                uint32_t wa   = GRead32(g_base, addr + 16), wd = GRead32(g_base, addr + 20);
+                static int cwlog = 0;
+                if (cwlog < 24)
+                {
+                    ++cwlog;
+                    std::fprintf(stderr,
+                        "[gpu] COND_WRITE info=%08X poll=%08X ref=%08X mask=%08X wr[%08X]=%08X\n",
+                        info, poll, ref, mask, wa, wd);
+                }
+                static const bool doWrite = std::getenv("TTT2_CONDWRITE") != nullptr;
+                if (doWrite)
+                {
+                    bool memPoll = (info & 0x10) != 0, memWrite = (info & 0x100) != 0;
+                    uint32_t v = memPoll ? GRead32(g_base, PhysToGuest(poll & ~3u))
+                                         : (poll < 0x8000 ? g_regFile[poll] : 0);
+                    v &= mask;
+                    bool ok;
+                    switch (info & 7)
+                    {
+                    case 1: ok = v <  ref; break;   case 2: ok = v <= ref; break;
+                    case 3: ok = v == ref; break;   case 4: ok = v != ref; break;
+                    case 5: ok = v >= ref; break;   case 6: ok = v >  ref; break;
+                    default: ok = (info & 7) != 0; break;
+                    }
+                    if (ok)
+                    {
+                        if (memWrite) GWrite32(g_base, PhysToGuest(wa & ~3u), wd);
+                        else WriteReg(wa & 0x7FFF, wd);
+                        GpuProgress();
+                    }
+                }
+            }
+            if (op == 0x22 || op == 0x36)                        // draws: dispatch on edram mode
+            {
+                // DRAW_INDX carries the initiator in dword1 and, when the index source is DMA,
+                // the index buffer address in dword2; DRAW_INDX_2 has the initiator in dword0
+                // and immediate indices inline right after it.
+                uint32_t init = GRead32(g_base, addr + (op == 0x22 ? 4 : 0));
+                uint32_t srcSel = (init >> 6) & 3;
+                bool index32 = ((init >> 8) & 1) != 0;
+                uint32_t indexAddr = 0;
+                // The index base (VGT_DMA_BASE) is aligned to the index size only: TTT2 packs
+                // many 16-bit strips back to back, and half of them start on a 2-byte boundary.
+                // Rounding those down to 4 bytes read the previous strip's last index as the
+                // first vertex - one triangle per mesh stretched into a neighbouring sub-mesh,
+                // the long "streak lines" across characters (measured 2026-10-11: strips at
+                // AF1D59B6 / AF1D5BDA / AE21847A were read from ...B4 / ...D8 / ...78).
+                if (srcSel == 0 && op == 0x22 && cnt >= 4)
+                    indexAddr = PhysToGuest(GRead32(g_base, addr + 8) & (index32 ? ~3u : ~1u));
+                else if (srcSel == 1)
+                    indexAddr = addr + (op == 0x22 ? 8 : 4);
+                // Dump the CONTENT draws: skip the 1-vertex point-list warm-up dummies and
+                // the rectangle-list clears/resolves, which arrive first and would otherwise
+                // eat the whole dump budget before any real geometry shows up.
+                uint32_t dprim = init & 0x3F;
+                ++g_primSeen[dprim];
+                if (dprim != 1 && dprim != 8 && dprim != 4) DumpDrawState(init, op);
+                if (dprim != 1 && dprim != 8 && dprim != 4 && CwOn())
+                {
+                    --g_cwBudget;
+                    char line[400]; int n2 = 0;
+                    n2 += BoundedSnprintf(line + n2, sizeof(line) - n2,
+                                        "[cw] seq=%u DRAW prim=%u vs=%08X ps=%08X rows:",
+                                        g_regSeq, dprim, g_curVs, g_curPs);
+                    for (uint32_t row = 126; row < 136; ++row)
+                    {
+                        const uint32_t* c = &g_regFile[0x4000 + row * 4];
+                        n2 += BoundedSnprintf(line + n2, sizeof(line) - n2, " c%u=%08X/%08X",
+                                            row, c[0], c[1]);
+                    }
+                    BoundedSnprintf(line + n2, sizeof(line) - n2, "\n");
+                    std::fputs(line, stderr);
+                }
+                FrameLogDraw(init);
+                if (!CpDiscarding())
+                {
+                    const uint64_t dq0 = __rdtsc();     // p_diag41: the timestamp counter, in QPC ticks
+                    GpuExecuteDraw(g_regFile, init, indexAddr, index32,
+                                   GpuShader{ g_curVs, g_curVsSize },
+                                   GpuShader{ g_curPs, g_curPsSize });
+                    // p_diag47 TEST ONLY: TTT2_DIAG_CP_SPIN_NS adds a busy wait to every draw (a slower PC's command processor).
+                    static const int64_t spinNs = [] { const char* e = std::getenv("TTT2_DIAG_CP_SPIN_NS"); return e ? std::atoll(e) : 0LL; }();
+                    if (spinNs > 0)
+                    {
+                        const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spinNs);
+                        while (std::chrono::steady_clock::now() < until) _mm_pause();
+                    }
+                    const int64_t dqTicks = int64_t(double(__rdtsc() - dq0) * GpuDiagTscToQpc());
+                    g_diagDrawPacketTicks.fetch_add(dqTicks, std::memory_order_relaxed);
+                    g_diagFrameDraws.fetch_add(1, std::memory_order_relaxed);
+                    g_diagFramePacketTicks.fetch_add(dqTicks, std::memory_order_relaxed);
+                    {
+                        uint32_t* L = g_diagLastDraw;    // TEST ONLY (p_diag29)
+                        L[0] = init; L[1] = g_curVs; L[2] = g_curVsSize; L[3] = g_curPs; L[4] = g_curPsSize;
+                        L[5] = g_regFile[0x2000]; L[6] = g_regFile[0x2001]; L[7] = g_regFile[0x2002]; L[8] = g_regFile[0x2208];
+                        L[9] = g_regFile[0x2318]; L[10] = g_regFile[0x2319];
+                    }
+                    if ((g_regFile[0x2208] & 7u) == 6u) IssueResolve();
+                }
+            }
+            if (op == 0x22 || op == 0x36 || op == 0x34)          // DRAW_INDX / DRAW_INDX_2 / VIZQUERY?
+            {
+                static int dlog = 0;
+                if (dlog < 48)
+                {
+                    ++dlog;
+                    char line[640]; int n = 0;
+                    n += BoundedSnprintf(line + n, sizeof(line) - n, "[draw] op=%02X cnt=%u pay:", op, cnt);
+                    for (uint32_t i = 0; i < cnt && i < 6; ++i)
+                        n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X", GRead32(g_base, addr + i * 4));
+                    // key state: RB_SURFACE/COLOR/DEPTH_INFO (2000-2002), COPY ctl (2318-231C),
+                    // SQ_PROGRAM_CNTL (2180), PGM starts (2100/2104? per Xenos docs), viewport.
+                    static const uint16_t regs[] = { 0x2000, 0x2001, 0x2002, 0x2318, 0x2319,
+                                                     0x231A, 0x231B, 0x231C, 0x2180, 0x2100,
+                                                     0x2101, 0x210C, 0x2104, 0x2280, 0x2281 };
+                    n += BoundedSnprintf(line + n, sizeof(line) - n, " regs:");
+                    for (uint16_t rg : regs)
+                        n += BoundedSnprintf(line + n, sizeof(line) - n, " %X=%08X", rg, g_regFile[rg]);
+                    BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+                    std::fputs(line, stderr);
+                    if (dlog == 20)
+                    {
+                        // One-time full register inventory: every nonzero reg the stream wrote.
+                        std::fprintf(stderr, "[draw] ==== register inventory ====\n");
+                        for (uint32_t rg = 0; rg < 0x6000; ++rg)
+                            if (g_regFile[rg])
+                                std::fprintf(stderr, "[draw] reg %04X = %08X\n", rg, g_regFile[rg]);
+                        std::fprintf(stderr, "[draw] ==== end inventory ====\n");
+                    }
+                }
+            }
+            if ((op == 0x3F || op == 0x37) && cnt >= 2)          // INDIRECT_BUFFER / _PFD
+            {
+                uint32_t ib = PhysToGuest(GRead32(g_base, addr));
+                uint32_t n = GRead32(g_base, addr + 4) & 0xFFFFF;
+                ExecPacketStream(ib, n * 4, depth + 1);
+            }
+            else if (op == 0x58 && cnt >= 3)                     // EVENT_WRITE_SHD (fence)
+            {
+                uint32_t dst = PhysToGuest(GRead32(g_base, addr + 4) & ~3u);
+                uint32_t val = GRead32(g_base, addr + 8);
+                if (dst) { GWrite32(g_base, dst, val); GpuNoteMemory(4, dst, 4); }
+                g_cpSyncEpoch.fetch_add(1, std::memory_order_relaxed);   // a fence: the CPU may go on
+                GpuProgress();
+                static int flog = 0;
+                if (flog < 24)
+                {
+                    ++flog;
+                    std::fprintf(stderr, "[vd] fence: [%08X]=%08X\n", dst, val);
+                }
+            }
+            else if (op == 0x3D && cnt >= 2)                     // MEM_WRITE
+            {
+                uint32_t dst = PhysToGuest(GRead32(g_base, addr) & ~3u);
+                if (dst) GpuNoteMemory(4, dst, (cnt - 1) * 4);
+                for (uint32_t i = 1; i < cnt && dst; ++i)
+                    GWrite32(g_base, dst + (i - 1) * 4, GRead32(g_base, addr + i * 4));
+                g_cpSyncEpoch.fetch_add(1, std::memory_order_relaxed);
+                GpuProgress();
+            }
+            else if (op == 0x3C && cnt >= 5)                     // WAIT_REG_MEM
+            {
+                TryEarlyPresent(GRead32(g_base, addr), GRead32(g_base, addr + 4));
+                const bool waitFailed = WaitRegMem(GRead32(g_base, addr), GRead32(g_base, addr + 4),
+                                                   GRead32(g_base, addr + 8), GRead32(g_base, addr + 12));
+                g_cpSyncEpoch.fetch_add(1, std::memory_order_relaxed);   // past a wait: what the CPU wrote counts
+                if (waitFailed)
+            {
+                // A timed-out wait is the open SCRATCH_REG1 puzzle: dump the stream around
+                // the packet so the arming sequence and what follows are visible. addr points
+                // at this packet's payload; the window behind it holds whatever armed the
+                // register, the window ahead holds what the game expects to run after.
+                static int sdump = 4;
+                if (sdump-- > 0)
+                {
+                    std::fprintf(stderr, "[wrm] STREAM around timed-out wait @%08X:\n", addr - 4);
+                    for (int32_t off = -96; off < 64; off += 16)
+                    {
+                        char l2[160]; int n4 = 0;
+                        n4 += BoundedSnprintf(l2 + n4, sizeof(l2) - n4, "[wrm]   %+05d:", off);
+                        for (int k2 = 0; k2 < 4; ++k2)
+                            n4 += BoundedSnprintf(l2 + n4, sizeof(l2) - n4, " %08X",
+                                                GRead32(g_base, addr + off + k2 * 4));
+                        BoundedSnprintf(l2 + n4, sizeof(l2) - n4, "\n");
+                        std::fputs(l2, stderr);
+                    }
+                }
+                // A failed fence is not permission to execute commands after it.
+                // Continuing previously called the intentionally disarmed callback.
+                std::fputs("[pm4-fault] fence wait failed; stopping command execution\n", stderr);
+                std::fflush(stderr);
+                LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+                std::abort();
+            }
+            }
+            else if (op == 0x54 && cnt >= 1)                     // CP_INTERRUPT
+            {
+                uint32_t mask9 = GRead32(g_base, addr);
+                static int ilog = 0;
+                if (ilog < 12)
+                {
+                    ++ilog;
+                    std::fprintf(stderr, "[vd] CP_INTERRUPT mask=%08X\n", mask9);
+                }
+                RaiseCpInterrupt(mask9);
+                g_cpSyncEpoch.fetch_add(1, std::memory_order_relaxed);
+            }
+            else if (op != 0x10 && op != 0x3F && op != 0x37 && op != 0x3C && op != 0x3D &&
+                     op != 0x58 && op != 0x3B && op != 0x48 && op != 0x21 && op != 0x22 &&
+                     op != 0x36 && op != 0x34)
+            {
+                static uint8_t seen[128];
+                if (op < 128 && seen[op] < 4)
+                {
+                    ++seen[op];
+                    char line[300]; int n3 = 0;
+                    n3 += BoundedSnprintf(line + n3, sizeof(line) - n3,
+                                        "[unk] T3 op=%02X cnt=%u :", op, cnt);
+                    for (uint32_t i = 0; i < cnt && i < 12; ++i)
+                        n3 += BoundedSnprintf(line + n3, sizeof(line) - n3, " %08X",
+                                            GRead32(g_base, addr + i * 4));
+                    BoundedSnprintf(line + n3, sizeof(line) - n3, "\n");
+                    std::fputs(line, stderr);
+                }
+            }
+            addr += cnt * 4;
+        }
+        else if (type == 0)                                      // register writes
+        {
+            uint32_t cnt = ((h >> 16) & 0x3FFF) + 1;
+            uint32_t reg = h & 0x7FFF;
+            bool oneReg = (h & 0x8000) != 0;
+            if (g_pm4Trace > 0)
+            {
+                --g_pm4Trace;
+                char line[300]; int n = 0;
+                n += BoundedSnprintf(line + n, sizeof(line) - n,
+                                   "[pm4] d%d @%08X h=%08X T0 reg=%04X cnt=%-4u one=%d :",
+                                   depth, addr - 4, h, reg, cnt, (int)oneReg);
+                for (uint32_t i = 0; i < cnt && i < 10; ++i)
+                    n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X",
+                                       GRead32(g_base, addr + i * 4));
+                if (cnt > 10) n += BoundedSnprintf(line + n, sizeof(line) - n, " ...");
+                BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+                std::fputs(line, stderr);
+            }
+            // The 2D transform block c128..c133 arrives by type-0 write and lands half-zero.
+            // Log WHERE in guest memory the c128 payload sits (the D3D runtime memcpy'd it
+            // there from the game's staging buffer) so a TTT2_WATCH on that spot can name the
+            // writer - the next hop toward the code that builds the defective matrix.
+            if (CwOn() && !oneReg && reg <= 0x4200 && reg + cnt > 0x4200)
+            {
+                --g_cwBudget;
+                std::fprintf(stderr, "[cw] c128 payload at guest %08X (T0 reg=%04X cnt=%u)\n",
+                             addr + (0x4200 - reg) * 4, reg, cnt);
+            }
+            for (uint32_t i = 0; i < cnt; ++i)
+                WriteReg(oneReg ? reg : reg + i, GRead32(g_base, addr + i * 4));
+            addr += cnt * 4;
+        }
+        else if (type == 1)                                      // two independent registers
+        {
+            WriteReg(h & 0x7FF, GRead32(g_base, addr));
+            WriteReg((h >> 11) & 0x7FF, GRead32(g_base, addr + 4));
+            addr += 8;
+        }
+        // type 2: no payload
+    }
+}
+
+// The frame overlap's pre-scan (frame_overlap.cpp KickFence, the kick thread, in rounds): the memory the frame just
+// kicked reads - its packets from the previous kick's write pointer to this one's, through indirect buffers - so the
+// write guard protects it before the game writes the next frame, also what no frame read before (a stage effect's
+// first frame, a particle buffer that grows a page). At each draw: the vertex buffers of the fetch constants written
+// since the previous draw (a frame rebinds the same slots draw after draw: MEASURED 2026-10-28, about 7,000 fetch
+// constant writes a frame on Festive Parade, so the slots' last values name few of its buffers), the draw's DMA
+// indices; and the sources of constant loads. A shadow of the fetch constants keeps pairs written in two packets whole.
+namespace prescan {
+uint32_t shadow[0xC0];
+uint32_t lastWptr = ~0u;
+uint64_t dirty[2];                                       // vertex fetch slots written since the last draw
+void (*noteFn)(int kind, uint32_t addr, uint32_t bytes) = nullptr;
+void Reg(uint32_t reg, uint32_t v)
+{
+    if (reg < 0x4800 || reg >= 0x48C0) return;
+    shadow[reg - 0x4800] = v;
+    const uint32_t s = (reg - 0x4800) >> 1;
+    dirty[s >> 6] |= 1ull << (s & 63);
+}
+// A draw (DRAW_INDX 0x22 / DRAW_INDX_2 0x36; p = its payload, cnt words): the slots written for it and its indices, as
+// the command processor reads them (kernel_video.cpp ExecPacketStream).
+void Draw(uint32_t op, const uint32_t* p, uint32_t cnt)
+{
+    for (int w = 0; w < 2; ++w)
+        for (uint64_t bits = dirty[w]; bits; bits &= bits - 1)
+        {
+            const uint32_t s = uint32_t(w * 64 + __builtin_ctzll(bits)), c0 = shadow[2 * s], c1 = shadow[2 * s + 1];
+            if ((c0 & 3) != 3) continue;                         // not a vertex fetch constant
+            const uint32_t addr = PhysToGuest(c0 & ~3u), bytes = ((c1 >> 2) & 0xFFFFFF) * 4;
+            if (addr && bytes && bytes <= (16u << 20)) noteFn(1, addr, bytes);
+        }
+    dirty[0] = dirty[1] = 0;
+    if (op != 0x22 || cnt < 4) return;
+    const uint32_t init = p[1];
+    if (((init >> 6) & 3) != 0) return;                      // indices not from memory
+    const bool index32 = ((init >> 8) & 1) != 0;
+    const uint32_t addr = PhysToGuest(p[2] & (index32 ? ~3u : ~1u)), bytes = (init >> 16) * (index32 ? 4 : 2);
+    if (addr && bytes) noteFn(2, addr, bytes);
+}
+// One packet (host-order words, w[0] = header, n words).
+void Stream(uint32_t addr, uint32_t size, int depth);
+void Packet(const uint32_t* w, uint32_t n, int depth)
+{
+    const uint32_t h = w[0], type = h >> 30;
+    if (!h || h == 0x54535750u) return;
+    if (type == 0)
+    {
+        const uint32_t cnt = ((h >> 16) & 0x3FFF) + 1, reg = h & 0x7FFF;
+        const bool oneReg = (h & 0x8000) != 0;
+        for (uint32_t i = 0; i < cnt && 1 + i < n; ++i) Reg(oneReg ? reg : reg + i, w[1 + i]);
+    }
+    else if (type == 1 && n >= 3)
+    {
+        Reg(h & 0x7FF, w[1]);
+        Reg((h >> 11) & 0x7FF, w[2]);
+    }
+    else if (type == 3)
+    {
+        const uint32_t op = (h >> 8) & 0x7F, cnt = ((h >> 16) & 0x3FFF) + 1;
+        if (1 + cnt > n) return;
+        const uint32_t* p = w + 1;
+        if ((op == 0x3F || op == 0x37) && cnt >= 2) Stream(PhysToGuest(p[0]), (p[1] & 0xFFFFF) * 4, depth + 1);
+        else if (op == 0x22 || op == 0x36) Draw(op, p, cnt);
+        else if ((op == 0x2D || op == 0x55 || op == 0x56) && cnt >= 1)
+        {
+            uint32_t reg;
+            if (op == 0x2D)
+            {
+                static const uint32_t base[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+                const uint32_t bank = (p[0] >> 16) & 0xFF, idx = p[0] & 0x7FF;
+                reg = (bank < 5 ? base[bank] : 0x2000) + idx;
+            }
+            else reg = p[0] & 0xFFFF;
+            for (uint32_t i = 1; i < cnt; ++i) Reg(reg + i - 1, p[i]);
+        }
+        else if (op == 0x2F && cnt >= 3)                     // LOAD_ALU_CONSTANT
+        {
+            const uint32_t src = PhysToGuest(p[0] & 0x3FFFFFFCu), bank = (p[1] >> 16) & 0xFF, idx = p[1] & 0x7FF;
+            const uint32_t count = p[2] & 0xFFF;
+            if (src && count) noteFn(3, src, count * 4);
+            if (bank == 1 && src)
+                for (uint32_t i = 0; i < count && idx + i < 0xC0; ++i) Reg(0x4800 + idx + i, GRead32(g_base, src + i * 4));
+        }
+    }
+}
+void Stream(uint32_t addr, uint32_t size, int depth)
+{
+    if (depth > 4 || !addr || uint64_t(addr) + size > 0x100000000ull) return;
+    uint32_t w[64];
+    for (const uint32_t end = addr + size; uint64_t(addr) + 4 <= end;)
+    {
+        const uint32_t h = GRead32(g_base, addr), bytes = GpuPacketBytes(h);
+        if (uint64_t(addr) + bytes > end) return;
+        const uint32_t type = h >> 30;
+        if (type == 0 || type == 3)
+        {
+            // Only the register, constant, draw and indirect-buffer packets matter: their words as far as w holds
+            // (longer register runs are read in pieces).
+            const uint32_t n = bytes / 4;
+            const uint32_t op = (h >> 8) & 0x7F;
+            const bool wanted = type == 0 || op == 0x3F || op == 0x37 || op == 0x2D || op == 0x55 || op == 0x56 || op == 0x2F
+                                || op == 0x22 || op == 0x36;
+            if (wanted && n <= 64)
+            {
+                for (uint32_t i = 0; i < n; ++i) w[i] = GRead32(g_base, addr + i * 4);
+                Packet(w, n, depth);
+            }
+            else if (wanted && type == 0)
+            {
+                const uint32_t cnt = ((h >> 16) & 0x3FFF) + 1, reg = h & 0x7FFF;
+                const bool oneReg = (h & 0x8000) != 0;
+                for (uint32_t i = 0; i < cnt; ++i) Reg(oneReg ? reg : reg + i, GRead32(g_base, addr + 4 + i * 4));
+            }
+            else if (wanted && (op == 0x2D || op == 0x55 || op == 0x56))
+            {
+                const uint32_t d0 = GRead32(g_base, addr + 4);
+                uint32_t reg;
+                if (op == 0x2D)
+                {
+                    static const uint32_t base[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+                    const uint32_t bank = (d0 >> 16) & 0xFF, idx = d0 & 0x7FF;
+                    reg = (bank < 5 ? base[bank] : 0x2000) + idx;
+                }
+                else reg = d0 & 0xFFFF;
+                for (uint32_t i = 2; i < n; ++i) Reg(reg + i - 2, GRead32(g_base, addr + i * 4));
+            }
+            else if (wanted && (op == 0x22 || op == 0x36))
+            {
+                // A draw with immediate indices: its first words only.
+                for (uint32_t i = 0; i < 5; ++i) w[i] = GRead32(g_base, addr + i * 4);
+                Draw(op, w + 1, n - 1);
+            }
+        }
+        else if (type == 1) { Reg(h & 0x7FF, GRead32(g_base, addr + 4)); Reg((h >> 11) & 0x7FF, GRead32(g_base, addr + 8)); }
+        addr += bytes;
+    }
+}
+}
+// Scans what the game published since the last call; `note` gets the memory its draws read (kind 1 vertex, 2 index,
+// 3 constants; guest address, bytes). With scan false only the position moves on.
+void GpuPrescanKicked(bool scan, void (*note)(int kind, uint32_t addr, uint32_t bytes))
+{
+    const uint32_t rb = g_ringBase, rs = g_ringSize;
+    if (!rb || !rs) return;
+    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    uint32_t wptrOff;
+    if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;
+    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
+    else return;
+    const uint32_t from = prescan::lastWptr;
+    prescan::lastWptr = wptrOff;
+    if (!scan || from >= rs || from == wptrOff) return;
+    prescan::noteFn = note;
+    WalkGpuRing(rs, from, wptrOff, [rb](uint32_t offset) { return GRead32(g_base, rb + offset); },
+        [rb, rs](const GpuRingPacket& packet)
+        {
+            if (!packet.Wraps()) { prescan::Stream(rb + packet.offset, packet.size, 0); return; }
+            uint32_t w[64];
+            const uint32_t n = packet.size / 4;
+            if (n > 64) return;
+            for (uint32_t i = 0; i < n; ++i) w[i] = GRead32(g_base, rb + ((packet.offset + i * 4) & (rs - 1)));
+            prescan::Packet(w, n, 0);
+        });
+}
+
+void LowLatencyRingRead(uint32_t from, uint32_t to, uint32_t size);   // low_latency.cpp
+static void ConsumeRing()
+{
+    frame_overlap::MarkCpThread();                      // never waits in the frame overlap's write guard
+    uint32_t rb = g_ringBase, rs = g_ringSize;
+    if (!rb || !rs) return;
+    // Consume only what the game PUBLISHED via the CP_RB_WPTR doorbell (MMIO 0x7FC80714,
+    // dword index; mirrored at device+11088) - the CPU cursor at device+48 races the writes.
+    uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    uint32_t wptrOff;
+    if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;   // dword index, including zero
+    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
+    else return;
+    const uint32_t from = g_ringRptr.load();
+    if (wptrOff == from) return;
+    g_cpSyncEpoch.fetch_add(1, std::memory_order_relaxed);
+    const auto result = WalkGpuRing(rs, from, wptrOff,
+        [rb](uint32_t offset) { return GRead32(g_base, rb + offset); },
+        [rb](const GpuRingPacket& packet)
+        {
+            if (!packet.Wraps())
+            {
+                ExecPacketStream(rb + packet.offset, packet.size, 0);
+                return;
+            }
+            // Only the CP thread uses this stable staging area. A wrapped primary
+            // packet (normally an IB reference) must be contiguous for the decoder.
+            static uint32_t staging = 0;
+            if (!staging)
+            {
+                void* allocation = g_virtualHeap.Alloc(GpuMaxPacketBytes, 16);
+                if (!allocation)
+                {
+                    std::fputs("[pm4-fault] cannot allocate wrapped-packet staging\n", stderr);
+                    std::fflush(stderr);
+                    LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+                    std::abort();
+                }
+                staging = GuestAddr(g_base, allocation);
+            }
+            std::memcpy(g_base + staging, g_base + rb + packet.offset, packet.firstBytes);
+            std::memcpy(g_base + staging + packet.firstBytes, g_base + rb,
+                        packet.size - packet.firstBytes);
+            ExecPacketStream(staging, packet.size, 0);
+        });
+    if (result.status != GpuRingStatus::Complete)
+    {
+        std::fprintf(stderr,
+            "[pm4-fault] invalid published ring packet @%08X h=%08X required=%u available=%u ring=%08X+%X rptr=%X wptr=%X\n",
+            rb + result.offset, result.header, result.required, result.remaining,
+            rb, rs, g_ringRptr.load(), wptrOff);
+        std::fflush(stderr);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
+        std::abort();
+    }
+    g_ringRptr.store(result.offset);
+    LowLatencyRingRead(from, result.offset, rs);        // low_latency.cpp: a drawn list's last command reached?
+    // Rptr writeback: real hardware reports a LAGGING, block-quantized read pointer
+    // (VdEnableRingBufferRPtrWriteBack registers block-size log2 = 6 for this ring, so
+    // the value only advances in 0x40-dword steps). Publishing the exact consumption
+    // point can land inside a tail-rewrite window (wptr, wptr+n] and wedge the
+    // ring-space wait (sub_82738830) forever - hardware never exposes that state.
+    if (uint32_t wb = g_rptrWriteBack.load())
+        GWrite32(g_base, wb, (result.offset / 4) & ~0x3Fu);
+    GpuProgress();
+}
+
+// low_latency.cpp: where the game's published commands end (ring offset) and the ring's size; where the command
+// processor has read to.
+bool GpuRingPublished(uint32_t& offset, uint32_t& size)
+{
+    const uint32_t rb = g_ringBase, rs = g_ringSize;
+    if (!rb || !rs) return false;
+    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    if ((uint64_t)doorbell * 4 < rs) offset = doorbell * 4;
+    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) offset = doorbell - rb;
+    else return false;
+    size = rs;
+    return true;
+}
+uint32_t GpuRingReadOffset() { return g_ringRptr.load(); }
+
+// rollback.cpp: the command processor has consumed everything the game published - no frame in
+// flight still reads guest memory.
+uint32_t GpuRingPendingBytes()
+{
+    const uint32_t rb = g_ringBase, rs = g_ringSize;
+    if (!rb || !rs) return 0;
+    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    uint32_t wptrOff;
+    if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;
+    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
+    else return 0;
+    const uint32_t r = g_ringRptr.load();
+    return wptrOff >= r ? wptrOff - r : rs - r + wptrOff;
+}
+bool GpuRingDrained()
+{
+    const uint32_t rb = g_ringBase, rs = g_ringSize;
+    if (!rb || !rs) return true;
+    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    uint32_t wptrOff;
+    if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;
+    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
+    else return true;
+    return wptrOff == g_ringRptr.load();
+}
+
+// The CP thread: consume as soon as work is published. While frames are flowing the game kicks
+// every few milliseconds, so after consuming anything stay awake (yield) for 4 ms: a new kick
+// then starts within microseconds instead of after a 1 ms sleep (measured 2026-10-11: with the
+// vertex stage on the GPU the main thread spent ~45% spinning on CP progress, much of it this
+// latency). Fully idle, fall back to the 1 ms cadence.
+void KernelMarkFrameCriticalThread(const char* what);   // kernel_objects.cpp (diag15)
+static void CommandProcessorThread()
+{
+    KernelMarkFrameCriticalThread("the command processor");
+    InitGpuTrace();
+    HitchRegisterThread("cp");
+    auto lastWork = std::chrono::steady_clock::now();
+    auto loopEnd = lastWork, report = lastWork;
+    for (;;)
+    {
+        const uint32_t before = g_ringRptr.load();
+        const auto ringStart = std::chrono::steady_clock::now();
+        const uint64_t ringStartUs = timeline::On() ? timeline::NowUs() : 0;
+        ConsumeRing();
+        const auto now = std::chrono::steady_clock::now();
+        if (g_ringRptr.load() != before)
+        {
+            lastWork = now;
+            if (timeline::On())
+            {
+                auto& ring = timeline::Ring();
+                ring[timeline::Next().fetch_add(1) & (timeline::kEntries - 1)] =
+                    timeline::Entry{ ringStartUs, before, timeline::ThreadTag(), uint8_t(timeline::CpRing), uint8_t('+') };
+                timeline::Mark(timeline::CpRing, '-', g_ringRptr.load());
+            }
+        }
+        if (now - lastWork < std::chrono::milliseconds(4)) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (FrameTimeLog())
+        {
+            using ms = std::chrono::duration<double, std::milli>;
+            const auto end = std::chrono::steady_clock::now();
+            g_cpTimes.ringMs += ms(now - ringStart).count();
+            g_cpTimes.idleMs += ms(ringStart - loopEnd).count() + ms(end - now).count();
+            loopEnd = end;
+            if (end - report >= std::chrono::seconds(10))
+            {
+                const CpTimes& t = g_cpTimes;
+                std::fprintf(stderr, "[frame] cp 10s: executing %.0f ms, scratch waits %.0f ms (%llu), memory waits %.0f ms (%llu), register waits %.0f ms (%llu), idle %.0f ms\n",
+                             t.ringMs - t.waitMs[0] - t.waitMs[1] - t.waitMs[2], t.waitMs[0], (unsigned long long)t.waits[0],
+                             t.waitMs[1], (unsigned long long)t.waits[1], t.waitMs[2], (unsigned long long)t.waits[2], t.idleMs);
+                std::vector<std::pair<double, uint32_t>> top;
+                for (const auto& [address, w] : t.memoryWaits) top.push_back({ w.second, address });
+                std::sort(top.rbegin(), top.rend());
+                char line[512];
+                int n = BoundedSnprintf(line, sizeof(line), "[frame] cp memory waits by address:");
+                for (size_t i = 0; i < top.size() && i < 6; ++i)
+                    n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X=%.0fms/%llu", top[i].second, top[i].first,
+                                         (unsigned long long)t.memoryWaits.at(top[i].second).first);
+                std::fprintf(stderr, "%s\n", line);
+                g_cpTimes = {};
+                report = end;
+            }
+        }
+    }
+}
+
+// 60 Hz "GPU": complete fences, report ring progress, raise the graphics interrupt.
+// Find every copy of the game's ortho projection matrix in guest memory. Fingerprint:
+// row0.x = 0x3ACCCCCD (2/1280) and row2.z = 0xB8B67793. The 2D compose uploads rows 128..135
+// with row1 (y scale) and row3 (offsets) ZEROED while row0/row2 arrive intact - so somewhere
+// there is a complete source matrix and a half-copied shadow. This sweep prints both, so the
+// next run can put a write-watch on the shadow's zero row and name the code that builds it.
+static void ScanOrthoPattern(uint32_t lo, uint32_t hi, const char* tag)
+{
+    static const uint8_t pat[4] = { 0x3A, 0xCC, 0xCC, 0xCD };
+    uint32_t a = lo;
+    int found = 0;
+    while (a + 64 <= hi && found < 40)
+    {
+        // Guest space is committed as a whole, but pages the runtime protected (write-watch,
+        // null guard, stack guards) fault on a raw read - and this runs on the vblank thread
+        // with no SEH net (measured: the first version killed the thread at exactly the scan
+        // tick). Walk regions and only touch plainly readable ones.
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(g_base + a, &mbi, sizeof(mbi))) break;
+        uint32_t regEnd = (uint32_t)std::min<uint64_t>(
+            (uint64_t)((uint8_t*)mbi.BaseAddress - g_base) + mbi.RegionSize, hi);
+        bool readable = mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
+        if (!readable || regEnd <= a + 64) { a = regEnd ? regEnd : hi; continue; }
+        const void* f = std::memchr(g_base + a, 0x3A, (size_t)(regEnd - a - 60));
+        if (!f) break;
+        uint32_t addr = (uint32_t)((const uint8_t*)f - g_base);
+        a = addr + 1;
+        if (addr & 3) continue;
+        if (std::memcmp(g_base + addr, pat, 4) != 0) continue;
+        if (GRead32(g_base, addr + 40) != 0xB8B67793u) continue;
+        uint32_t r1 = GRead32(g_base, addr + 16) | GRead32(g_base, addr + 20) |
+                      GRead32(g_base, addr + 24) | GRead32(g_base, addr + 28);
+        ++found;
+        std::fprintf(stderr, "[scan] %s ortho@%08X row1=%s row1.y=%08X row3.x=%08X row3.w=%08X\n",
+                     tag, addr, r1 ? "OK" : "ZERO", GRead32(g_base, addr + 20),
+                     GRead32(g_base, addr + 48), GRead32(g_base, addr + 60));
+    }
+}
+
+// Rollback sessions' time sync (rollback_session.cpp): microseconds added to the next vblank periods
+// while this instance runs ahead of the other one - the game's clock itself goes slower, so the frame
+// loop cannot catch the time up (it does after a late frame).
+std::atomic<int32_t> g_vblankStretchUs{ 0 };
+void VideoSetVblankStretch(int32_t us) { g_vblankStretchUs.store(us < 0 ? 0 : us); }
+
+static void VideoTick()
+{
+    using clock = std::chrono::steady_clock;
+    auto next = clock::now();
+    // TTT2_TEST_VBLANK_US=<period> (tests): another vblank period - an instance that runs slower than 60 Hz
+    // for good (the time sync's two-instance tests).
+    static const int periodUs = [] { const char* e = std::getenv("TTT2_TEST_VBLANK_US"); const int v = e ? std::atoi(e) : 0; return v >= 8000 && v <= 40000 ? v : 16667; }();
+    for (;;)
+    {
+        // A FIXED 59.94/60 Hz schedule: the game paces its frames to these vblanks, so the
+        // period must not stretch. (Measured 2026-10-11: re-anchoring to now() on every tick
+        // added the tick's own work plus the ~1 ms sleep overshoot to each period, so the
+        // "60 Hz" vblank ran slow and capped the game below 60 fps.) Sleep coarsely to ~1.5 ms
+        // before the deadline, then yield-spin to it. Only a session's time sync stretches it.
+        next += std::chrono::microseconds(periodUs + g_vblankStretchUs.load(std::memory_order_relaxed));
+        if (next - clock::now() > std::chrono::microseconds(1500))
+            std::this_thread::sleep_until(next - std::chrono::microseconds(1500));
+        while (clock::now() < next) std::this_thread::yield();
+        if (FrameTimeLog())
+        {
+            static FrameTimer vblanks{ "vblank" };
+            vblanks.Mark();
+        }
+        timeline::Mark(timeline::Vblank, '.');
+        {
+            static unsigned polls = 0;
+            if (timeline::On() && ++polls % 30 == 0) timeline::PollDumpTrigger();
+        }
+
+        // SYNC-TO-GPU PACING. The vblank is the game's master clock: swap pacing, the DPC
+        // tick (dev+16952), and every fence deadline derive from it. Our software renderer
+        // cannot yet keep 60 fps, and letting the clock run free while the CP falls seconds
+        // behind sent the game's CPU-side fence logic into its timeout paths - it re-armed
+        // fences the CP had not reached yet, and the CP then burned 3 s on each stale wait
+        // (measured: the run_s11h..s11i death spirals). So when the CP is far behind the
+        // doorbell, STALL THE CLOCK: the whole game runs slow-motion but stays in sync, and
+        // speeds up as the renderer does. Floor of ~6 Hz so nothing hard-deadlocks.
+        {
+            int stalls = 0;
+            for (; stalls < 10; ++stalls)
+            {
+                uint32_t rb2 = g_ringBase.load(), rs2 = g_ringSize.load();
+                if (!rb2 || !rs2) break;
+                uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+                uint32_t wptrOff;
+                if ((uint64_t)doorbell * 4 < rs2) wptrOff = doorbell * 4;
+                else if (doorbell >= rb2 && doorbell < rb2 + rs2) wptrOff = doorbell - rb2;
+                else break;
+                uint32_t lag = (wptrOff - g_ringRptr.load()) & (rs2 - 1);
+                if (lag < 0x30000) break;              // < 192 KB of unconsumed ring: on pace
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+            static std::atomic<uint64_t> stallTicks{ 0 };
+            if (stalls) stallTicks += stalls;
+            static uint64_t lastStallReport = 0;
+            uint64_t st = stallTicks.load();
+            if (st - lastStallReport >= 600)
+            {
+                lastStallReport = st;
+                std::fprintf(stderr, "[vd] pacing: %llu vblank-stall slices so far\n",
+                             (unsigned long long)st);
+            }
+            // Re-anchor only after a stall (or if this thread fell more than a frame behind):
+            // otherwise keep the fixed schedule.
+            if (stalls || clock::now() - next > std::chrono::microseconds(16667)) next = clock::now();
+        }
+
+        // Segment retirement and rptr writeback are handled by the CP thread executing
+        // the game's own EVENT_WRITE_SHD tail packets - do not fake counters here.
+        // Raise the interrupt: swap-complete (source 0, with pending bit set), then vblank.
+        static uint64_t ticks = 0;
+        ++ticks;
+        // The old unconditional heap scans ran on the timing-critical vblank
+        // thread and could delay the very fence acknowledgements the CP waits on.
+        // Keep this expensive, read-only investigation opt-in and off that thread.
+        static const bool orthoScan = std::getenv("TTT2_ORTHO_SCAN") != nullptr;
+        if (orthoScan && (ticks == 1500 || ticks == 9000))
+        {
+            const char* tag = ticks == 1500 ? "t25" : "t150";
+            std::thread([tag] {
+                ScanOrthoPattern(0x00100000, 0x02000000, tag);
+                ScanOrthoPattern(0xA0000000, 0xAA000000, tag);
+                ScanOrthoPattern(0xB3C00000, 0xB4100000, tag);
+            }).detach();
+        }
+        if (ticks % 600 == 1)
+            std::fprintf(stderr, "[vd] tick-alive #%llu\n", (unsigned long long)ticks);
+        if (uint32_t cb = g_intrCallback.load())
+        {
+            uint32_t ctxArg = g_intrContext.load();
+            GWrite32(g_base, MMIO_SWAP_STATUS, 1);
+            // Vblank raises ONLY source 0 (swap DPC). Source 1 is the CP interrupt and is
+            // raised exclusively by CP_INTERRUPT packets (the ISR calls [shadow+16]
+            // unconditionally, which holds 0x0BADF00D between fence sequences).
+            GuestSetCurrentCpu(0);
+            GuestCall2(cb, 0, ctxArg);
+            GpuProgress();
+            if (ticks % 600 == 0)
+            {
+                uint32_t rb2 = g_ringBase.load(), rs2 = g_ringSize.load(), dev2 = g_intrContext.load();
+                uint32_t nz = 0, firstNz = 0, firstOff = 0;
+                if (rb2 && rs2)
+                {
+                    uint32_t lim = rs2 > 0x400000 ? 0x400000 : rs2;
+                    for (uint32_t off = 0; off < lim; off += 4)
+                    {
+                        uint32_t v = GRead32(g_base, rb2 + off);
+                        if (v) { if (!nz) { firstNz = v; firstOff = off; } ++nz; }
+                    }
+                }
+                {
+                    uint32_t everCount = 0, lo = 512, hi = 0;
+                    for (uint32_t i = 0; i < 512; ++i)
+                        if (g_aluEver[i]) { ++everCount; if (i < lo) lo = i; hi = i; }
+                    std::fprintf(stderr,
+                        "[vd] aluEver=%u range=%u..%u c129=%u c131=%u c132=%u c133=%u\n",
+                        everCount, lo, hi, g_aluEver[129], g_aluEver[131], g_aluEver[132],
+                        g_aluEver[133]);
+                }
+                char prims[192]; int pn = 0;
+                pn += BoundedSnprintf(prims + pn, sizeof(prims) - pn, "[vd] prims:");
+                for (int pt = 0; pt < 64 && pn < 160; ++pt)
+                    if (g_primSeen[pt])
+                        pn += BoundedSnprintf(prims + pn, sizeof(prims) - pn, " %u:%u", pt,
+                                            g_primSeen[pt]);
+                BoundedSnprintf(prims + pn, sizeof(prims) - pn, "\n");
+                std::fputs(prims, stderr);
+                char ops[256]{}; int on = 0;
+                for (int op = 0; op < 128 && on < 200; ++op)
+                    if (g_opcodeSeen[op])
+                        on += BoundedSnprintf(ops + on, sizeof(ops) - on, " %02X:%u", op, g_opcodeSeen[op]);
+                // Screen-flow state: the scene-flow manager's loader machine + job slots
+                // (mgr=0x82E6C5B8; layout from the GIN decode workflow). Shows which screen
+                // state the game is parked in when no real draws are issued.
+                {
+                    constexpr uint32_t mgr = 0x82E6C5B8u;
+                    static const uint32_t slots[] = { 6840, 6896, 6960, 7016, 7080, 7144,
+                                                      7200, 7272, 7328, 7392, 7448 };
+                    char fl[512]; int fn2 = 0;
+                    fn2 += BoundedSnprintf(fl + fn2, sizeof(fl) - fn2,
+                        "[flow] mgr16=%08X mgr40=%08X jobs:",
+                        GRead32(g_base, mgr + 16), GRead32(g_base, mgr + 40));
+                    for (uint32_t s : slots)
+                    {
+                        uint32_t job = GRead32(g_base, mgr + s);
+                        fn2 += BoundedSnprintf(fl + fn2, sizeof(fl) - fn2, " %X=%08X",
+                            s, job && job < 0xFFFFF000u ? GRead32(g_base, job + 24) : job);
+                    }
+                    BoundedSnprintf(fl + fn2, sizeof(fl) - fn2, "\n");
+                    std::fputs(fl, stderr);
+                    // BootMode wait1 gate: sound-manager slot load/loaded bytes, the two
+                    // check-gate words, and the flow master gate (decode workflow session 6).
+                    uint32_t sm = GRead32(g_base, 0x82EE7904u);
+                    char sl[384]; int sn = 0;
+                    sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, "[boot] sm=%08X slots:", sm);
+                    if (sm && sm < 0xFFFFF000u)
+                        for (int k = 0; k < 6; ++k)
+                            sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " %u/%u",
+                                g_base[sm + 16 + 36 * k], g_base[sm + 17 + 36 * k]);
+                    sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn,
+                        " chk=%08X,%08X gate7496=%08X q:",
+                        GRead32(g_base, 0x82F321BCu), GRead32(g_base, 0x82F321C0u),
+                        GRead32(g_base, 0x82E6C5B8u + 7496));
+                    for (int i = 0; i < 8; ++i)
+                        sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " %08X",
+                            GRead32(g_base, 0x82F2B6DCu + i * 4));
+                    // Boot object 0x82E6B558's current state object (+4) and its fields -
+                    // the vtable identifies which fsm state the boot is parked in.
+                    uint32_t bhead = GRead32(g_base, 0x82E6B558u);
+                    sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " bhead=%08X/%08X s52=%d s64=%d",
+                        bhead, bhead && bhead < 0xFFFFF000u ? GRead32(g_base, bhead + 4) : 0,
+                        (int)GRead32(g_base, 0x82E6B558u + 52), (int)GRead32(g_base, 0x82E6B558u + 64));
+                    uint32_t bst = GRead32(g_base, 0x82E6B558u + 4);
+                    sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " bst=%08X [", bst);
+                    if (bst && bst < 0xFFFFF000u)
+                        for (int i = 0; i < 6; ++i)
+                            sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " %08X",
+                                GRead32(g_base, bst + i * 4));
+                    // Sign-in record container [mgr+12]: idx [+4], array [+8]; the boot
+                    // stage-3 gate reads [record+12] of the selected record.
+                    if (bst && bst < 0xFFFFF000u)
+                    {
+                        uint32_t cont = GRead32(g_base, bst + 12);
+                        uint32_t cidx = cont ? GRead32(g_base, cont + 4) : 0;
+                        uint32_t carr = cont ? GRead32(g_base, cont + 8) : 0;
+                        uint32_t e0 = carr ? GRead32(g_base, carr + 0) : 0;
+                        sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn,
+                            " cont=%08X idx=%u arr=%08X e0=%08X", cont, cidx, carr, e0);
+                        if (e0 && e0 < 0xFFFFF000u)
+                            for (int i = 0; i < 6; ++i)
+                                sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " %08X",
+                                    GRead32(g_base, e0 + i * 4));
+                    }
+                    // Boot stage-3 gate object = [signinMgr+16]; its vtbl+36 method is the
+                    // real gate. Print the object, its vtable, the slot-36 fn, and fields.
+                    if (bst && bst < 0xFFFFF000u)
+                    {
+                        uint32_t o16 = GRead32(g_base, bst + 16);
+                        uint32_t v16 = o16 ? GRead32(g_base, o16) : 0;
+                        uint32_t f36 = v16 ? GRead32(g_base, v16 + 36) : 0;
+                        char ol[320]; int on = 0;
+                        on += BoundedSnprintf(ol + on, sizeof(ol) - on,
+                            "[gate3] o16=%08X v16=%08X f36=%08X f:", o16, v16, f36);
+                        if (o16 && o16 < 0xFFFFF000u)
+                            for (int i = 0; i < 10; ++i)
+                                on += BoundedSnprintf(ol + on, sizeof(ol) - on, " %08X",
+                                    GRead32(g_base, o16 + i * 4));
+                        BoundedSnprintf(ol + on, sizeof(ol) - on, "\n");
+                        std::fputs(ol, stderr);
+                    }
+                    // Sign-in manager vtable (runtime): slot +36 gates boot stage 3.
+                    sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " ] svt:");
+                    for (int i = 0; i < 14; ++i)
+                        sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, " %08X",
+                            GRead32(g_base, 0x820DFAD4u + i * 4));
+                    sn += BoundedSnprintf(sl + sn, sizeof(sl) - sn, "\n");
+                    std::fputs(sl, stderr);
+                    // BootMode impl fsm: [0x82F30B94] -> impl; dump words (state fn ptrs are
+                    // 0x82xxxxxx code addresses identifying the parked state), plus the mode
+                    // manager's current mode id ([0x82E5B014]+12).
+                    uint32_t bm = GRead32(g_base, 0x82F30B94u);
+                    uint32_t mm = GRead32(g_base, 0x82E5B014u);
+                    char bl[512]; int bn = 0;
+                    bn += BoundedSnprintf(bl + bn, sizeof(bl) - bn, "[bmode] impl=%08X mode=%08X [",
+                        bm, mm && mm < 0xFFFFF000u ? GRead32(g_base, mm + 12) : 0xDEAD);
+                    if (bm && bm < 0xFFFFF000u)
+                        for (int i = 0; i < 16; ++i)
+                            bn += BoundedSnprintf(bl + bn, sizeof(bl) - bn, " %08X",
+                                GRead32(g_base, bm + i * 4));
+                    bn += BoundedSnprintf(bl + bn, sizeof(bl) - bn, " ]\n");
+                    std::fputs(bl, stderr);
+                }
+                uint32_t P2 = dev2 ? GRead32(g_base, dev2 + 11024) : 0;
+                std::fprintf(stderr,
+                    "[vd] sync dev=%08X P=%08X P0=%08X P60=%08X mir11088=%08X thr15344=%08X "
+                    "rbase15300=%08X rmask15304=%08X q17112=%u q16972=%u q16976=%u q16968=%u\n",
+                    dev2, P2,
+                    P2 ? GRead32(g_base, P2) : 0, P2 ? GRead32(g_base, P2 + 60) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 11088) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 15344) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 15300) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 15304) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 17112) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 16972) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 16976) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 16968) : 0);
+                std::fprintf(stderr,
+                    "[vd] tick #%llu scb=%u cur=%u cursor=%08X bell=%08X rptr=%X nz=%u dpcSwaps=%u defSegs=%u pend=%08X rfb=%u lit=%llu regw=%u/%u/%u/%u ops:%s\n",
+                    (unsigned long long)ticks,
+                    g_sysCmdBuf.load() ? GRead32(g_base, g_sysCmdBuf.load()) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 11036) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 48) : 0,
+                    GRead32(g_base, 0x7FC80714u), g_ringRptr.load(), nz,
+                    dev2 ? GRead32(g_base, dev2 + 16952) : 0,
+                    dev2 ? GRead32(g_base, dev2 + 11152) : 0,
+                    dev2 ? GRead32(g_base, GRead32(g_base, dev2 + 11028) + 16) : 0,
+                    g_resolvesToFront.load(), (unsigned long long)GpuLitDraws(),
+                    g_regWrites[0], g_regWrites[1], g_regWrites[2], g_regWrites[3], ops);
+            }
+        }
+    }
+}
+
+PPC_FUNC(__imp__VdInitializeEngines)
+{
+    KTrace("VdInitializeEngines");
+    std::fprintf(stderr, "[vd] InitializeEngines flags=%08X notify=%08X\n", ctx.r3.u32, ctx.r4.u32);
+    ctx.r3.u32 = 1;
+}
+
+PPC_FUNC(__imp__VdSetGraphicsInterruptCallback)
+{
+    KTrace("VdSetGraphicsInterruptCallback");
+    std::fprintf(stderr, "[vd] SetGraphicsInterruptCallback cb=%08X ctx=%08X\n", ctx.r3.u32, ctx.r4.u32);
+    g_intrCallback = ctx.r3.u32;
+    g_intrContext = ctx.r4.u32;
+    // Kernel DATA exports. The XEX loader is supposed to patch the import slots at
+    // 0x82000690/0x82000694 with the ADDRESSES of the kernel's exported VdGlobalXamDevice /
+    // VdGlobalDevice variables; ours still held the raw ordinals (0x1BF / 0x1BE), so the D3D
+    // runtime's ISR swap callback sub_82740610 resolved its device via *(0x1BE) == NULL and
+    // every store it made - the flip-queue enqueue, the swap serial, and the SCRATCH_REG1
+    // throttle ack at [shadow+4] - was silently erased by the null-page guard. (That is
+    // exactly the long-logged `[nullpage] write@0x42E0`: the swap spinlock at NULL+17120.)
+    // Point both slots at one real cell and publish the device in it.
+    if (uint32_t dev0 = ctx.r4.u32)
+    {
+        static uint32_t cell = 0;
+        if (!cell)
+        {
+            void* pcell = g_virtualHeap.Alloc(8, 16);
+            if (pcell) cell = (uint32_t)(reinterpret_cast<uint8_t*>(pcell) - g_base);
+        }
+        if (cell)
+        {
+            GWrite32(g_base, cell, dev0);
+            GWrite32(g_base, 0x82000690u, cell);
+            GWrite32(g_base, 0x82000694u, cell);
+            std::fprintf(stderr, "[vd] VdGlobalDevice import slots -> cell %08X = %08X\n",
+                         cell, dev0);
+        }
+    }
+    if (ctx.r3.u32 && !g_tickStarted.exchange(true))
+    {
+        StartBigStackThread([](void*) -> unsigned { DiagNameThread(L"video-tick"); VideoTick(); return 0; });
+        StartBigStackThread([](void*) -> unsigned { DiagNameThread(L"command-processor"); CommandProcessorThread(); return 0; });
+        if (int delay = EnvInt("TTT2_DUMPCONTAINERS", 0))
+            StartBigStackThread([](void*) -> unsigned {
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(EnvInt("TTT2_DUMPCONTAINERS", 60)));
+                SweepShaderContainers();
+                return 0;
+            });
+    }
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__VdInitializeRingBuffer)
+{
+    KTrace("VdInitializeRingBuffer");
+    uint32_t base_ = ctx.r3.u32, len = ctx.r4.u32;
+    // len=0xC and the D3D device's own ring mask ([dev+15304] = 0x1FFF DWORDS) pin the
+    // decode: ring bytes = 8 << len -> 32 KB. The old 0x1000<<len (16 MB) misparse could not
+    // bite until session 11: the stream never WRAPPED before the audio-driven engine ran at
+    // full submission rate. When it finally did, the CP walked off the real 32 KB ring into
+    // garbage memory, and the junk "packets" included type-0 writes that clobbered
+    // CP_RB_WPTR itself (the 13EB92E0 / 0D564F49 doorbell values of run_s11j).
+    uint32_t size = (len < 32) ? (8u << len) : len;
+    std::fprintf(stderr, "[vd] InitializeRingBuffer base=%08X len=%08X (size=%u)\n", base_, len, size);
+    g_ringBase = base_;
+    g_ringSize = size;
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__VdEnableRingBufferRPtrWriteBack)
+{
+    KTrace("VdEnableRingBufferRPtrWriteBack");
+    std::fprintf(stderr, "[vd] EnableRingBufferRPtrWriteBack addr=%08X (guest %08X) r4=%08X\n",
+                 ctx.r3.u32, PhysToGuest(ctx.r3.u32), ctx.r4.u32);
+    g_rptrWriteBack = PhysToGuest(ctx.r3.u32);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress)
+{
+    KTrace("VdSetSystemCommandBufferGpuIdentifierAddress");
+    std::fprintf(stderr, "[vd] SetSysCmdBufGpuIdentifierAddress addr=%08X\n", ctx.r3.u32);
+    g_sysCmdBuf = ctx.r3.u32 ? ctx.r3.u32 - 8 : 0;
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__VdGetSystemCommandBuffer)
+{
+    KTrace("VdGetSystemCommandBuffer");
+    if (ctx.r3.u32) std::memset(g_base + ctx.r3.u32, 0, 148);
+    GWrite32(base, ctx.r4.u32, 0);                              // current GPU identifier
+    ctx.r3.u32 = 0;
+}
+
+// Decode the surface address out of a 6-dword Xenos texture fetch constant, validating it
+// so a recycled stack buffer cannot point the window at unrelated memory. Layout confirmed
+// against the game's own block 8A000002 A44A9006 0059E4FF ...: dword0 bits 0-1 = type
+// (2 = texture), bits 22-30 = pitch/32, bit 31 = tiled; dword1 bits 0-5 = format,
+// bits 12-31 = base address >> 12; dword2 = (width-1) | (height-1) << 13.
+static uint32_t DecodeFrontBuffer(uint32_t fetchBlock)
+{
+    if (!fetchBlock) return 0;
+    uint32_t fw[6];
+    for (int i = 0; i < 6; ++i) fw[i] = GRead32(g_base, fetchBlock + i * 4);
+    if ((fw[0] & 3) != 2) return 0;                              // not a texture fetch constant
+    uint32_t surf = PhysToGuest((fw[1] >> 12) << 12);
+    uint32_t w = (fw[2] & 0x1FFF) + 1, h = ((fw[2] >> 13) & 0x1FFF) + 1;
+    static int flog = 0;
+    if (flog < 6)
+    {
+        ++flog;
+        std::fprintf(stderr,
+            "[vd] fetchblk %08X: %08X %08X %08X %08X %08X %08X -> surf=%08X %ux%u\n",
+            fetchBlock, fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], surf, w, h);
+    }
+    if (!surf || w != FB_W || h != FB_H) return 0;
+    // The surface is page-aligned: carry the fetch constant's 12-bit swizzle in the low bits
+    // (the front buffer reads .zyx1 = 0xA0A, undoing the final resolve's red/blue swap).
+    return surf | ((fw[3] >> 1) & 0xFFFu);
+}
+
+// VdSwap(r3=ring wptr+4 where the kernel writes the swap packet, r4=frontbuffer texture
+// fetch block, r5=identifier addr, ...). The caller at 0x82741738 reserves 64 dwords,
+// passes oldCursor+4, then sets its last-written cursor to oldCursor+256. This owns
+// [r3, r3+252] inclusive: all 64 words must be initialized, including the last word
+// on a reused command buffer. The flip bookkeeping runs in the game's own DPC.
+void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base) = nullptr;
+
+void DirtyMeasureFrame();   // rollback_probe.cpp (TTT2_DIRTY_MEASURE=1)
+
+bool RollbackInResimDraw();                    // rollback.cpp
+void RollbackResimTime(int id, double ms);
+
+// TEST ONLY (TTT2_DIAG_FIGHTERS=<file>): input latency work - the four fighter objects (0x28B0 bytes each from
+// 0x82E88960, ROLLBACK_PLAN.md) appended at every swap after its number (the [swap] lines'), to see in which frame
+// a fighter's state reacts to an input against the frame the picture does.
+static void DiagFighterDump(uint8_t* base, uint32_t swapNumber)
+{
+    static FILE* f = [] { const char* p = std::getenv("TTT2_DIAG_FIGHTERS"); return p && *p ? std::fopen(p, "wb") : nullptr; }();
+    if (!f) return;
+    const uint32_t header[2] = { swapNumber, 4 * 0x28B0 };
+    std::fwrite(header, sizeof(header), 1, f);
+    std::fwrite(base + 0x82E88960u, 4 * 0x28B0, 1, f);
+}
+
+PPC_FUNC(__imp__VdSwap)
+{
+    KTrace("VdSwap");
+    DiagFighterDump(base, uint32_t(g_gameSwaps.load() + 1));
+    struct SwapTimer
+    {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~SwapTimer() { if (RollbackInResimDraw()) RollbackResimTime(5, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()); }
+    } swapTimer;
+    DirtyMeasureFrame();
+    g_gameSwaps.fetch_add(1, std::memory_order_relaxed);
+    if (InputTimingOn())
+        std::fprintf(stderr, "[swap] #%u at %.1f ms\n", uint32_t(g_gameSwaps.load()),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    timeline::Mark(timeline::Swap, '.', uint32_t(g_gameSwaps.load()));
+    if (FrameTimeLog())
+    {
+        static FrameTimer swaps{ "swap" };
+        swaps.Mark();
+        static const bool once = (std::fprintf(stderr, "[frame] VdSwap thread %lu\n", GetCurrentThreadId()), true);
+        (void)once;
+    }
+    static int swaps = 0;
+    if (swaps < 5)
+        std::fprintf(stderr, "[vd] VdSwap #%d ring=%08X fbtex=%08X ident=%08X\n",
+                     ++swaps, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+    if (uint32_t surf = DecodeFrontBuffer(ctx.r4.u32))
+    {
+        g_frontBufferPhys.store(surf & ~0xFFFu);
+        g_frontBufferSwizzle.store(surf & 0xFFFu);
+        if (!g_presentStarted.exchange(true)) StartBigStackThread(PresentThread);
+    }
+    if (uint32_t p = ctx.r3.u32)
+    {
+        // Write a marker block the CP recognizes when it executes this segment (the real
+        // kernel writes a GPU swap packet here; the caller advances its cursor 64 dwords).
+        // On execution the CP must write the identifier to [r5] and enqueue the flip -
+        // that is what lets the present path consider the swap complete.
+        GWrite32(base, p + 0,  0x54535750u);        // 'TSWP' marker
+        GWrite32(base, p + 4,  ctx.r7.u32);         // identifier value
+        GWrite32(base, p + 8,  ctx.r5.u32);         // identifier address
+        GWrite32(base, p + 12, ctx.r4.u32);         // frontbuffer texture fetch block
+        // The fetch block lives on the CALLER'S STACK, so it is gone by the time the CP
+        // executes this packet (it decoded a stale/zero surface and pointed the window at
+        // the wrong memory). Decode it here, while it is still valid, and carry the result.
+        const uint32_t surface = DecodeFrontBuffer(ctx.r4.u32);
+        GWrite32(base, p + 16, surface);
+        for (int i = 5; i < 64; ++i) GWrite32(base, p + i * 4, 0x80000000u);
+        const uint32_t n = g_markerSwaps.load() + 1;
+        g_markerFb[n & 15].store(surface);
+        g_markerSwaps.store(n);
+        GpuProgress();                                  // a CP waiting for the vblank can present it now
+    }
+    // Port UI actions on the game's main thread, once per frame (menu_ext.cpp: the in-game
+    // profile / message-box screens). The guest's registers are restored afterwards.
+    if (g_uiFrameHook)
+    {
+        const PPCContext saved = ctx;
+        g_uiFrameHook(ctx, base);
+        ctx = saved;
+    }
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__VdQueryVideoMode)
+{
+    KTrace("VdQueryVideoMode");
+    uint32_t p = ctx.r3.u32;
+    if (p)
+    {
+        std::memset(g_base + p, 0, 48);
+        GWrite32(base, p + 0,  1280);          // DisplayWidth
+        GWrite32(base, p + 4,  720);           // DisplayHeight
+        GWrite32(base, p + 8,  0);             // IsInterlaced
+        GWrite32(base, p + 12, 1);             // IsWidescreen
+        GWrite32(base, p + 16, 1);             // IsHighDefinition
+        GWrite32(base, p + 20, 0x42700000);    // RefreshRate = 60.0f
+        GWrite32(base, p + 24, 1);             // VideoStandard (NTSC-M)
+        GWrite32(base, p + 28, 0x4A);
+        GWrite32(base, p + 32, 0x01);
+    }
+}
+
+PPC_FUNC(__imp__XGetVideoMode)
+{
+    KTrace("XGetVideoMode");
+    __imp__VdQueryVideoMode(ctx, base);
+}
+
+PPC_FUNC(__imp__VdQueryVideoFlags)
+{
+    KTrace("VdQueryVideoFlags"); ctx.r3.u32 = 1; }               // bit0 = widescreen
+
+PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded)
+{
+    KTrace("VdIsHSIOTrainingSucceeded"); ctx.r3.u32 = 1; }       // nonzero = succeeded
+
+PPC_FUNC(__imp__VdGetCurrentDisplayGamma)
+{
+    KTrace("VdGetCurrentDisplayGamma");
+    GWrite32(base, ctx.r3.u32, 2);                               // gamma type
+    GWrite32(base, ctx.r4.u32, 0x400CCCCD);                      // 2.2f
+}
+
+PPC_FUNC(__imp__VdGetCurrentDisplayInformation)
+{
+    KTrace("VdGetCurrentDisplayInformation");
+    uint32_t p = ctx.r3.u32;
+    if (p)
+    {
+        // The struct is 88 bytes. Writing more trashes the caller's stack frame: the
+        // present-path caller sub_827481E8 keeps its saved r30/r31 right after this
+        // buffer, and a larger memset nulls the restored device pointer (boot-stall!).
+        std::memset(g_base + p, 0, 88);
+        GWrite16(base, p + 72, 1280);
+        GWrite16(base, p + 74, 720);
+        GWrite16(base, p + 86, 60);
+    }
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__VdSetDisplayMode)
+{
+    KTrace("VdSetDisplayMode"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__VdSetDisplayModeOverride)
+{
+    KTrace("VdSetDisplayModeOverride"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__VdCallGraphicsNotificationRoutines)
+{
+    KTrace("VdCallGraphicsNotificationRoutines"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__VdInitializeScalerCommandBuffer)
+{
+    KTrace("VdInitializeScalerCommandBuffer"); ctx.r3.u32 = 0; } // 0 dwords written
+PPC_FUNC(__imp__VdRetrainEDRAM)
+{
+    KTrace("VdRetrainEDRAM"); ctx.r3.u32 = 0; }                  // 0 = done, no ring pass needed
+PPC_FUNC(__imp__VdRetrainEDRAMWorker)
+{
+    KTrace("VdRetrainEDRAMWorker"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__VdEnableDisableClockGating)
+{
+    KTrace("VdEnableDisableClockGating"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__VdShutdownEngines)
+{
+    KTrace("VdShutdownEngines"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__VdPersistDisplay)
+{
+    KTrace("VdPersistDisplay");
+    if (ctx.r3.u32) { GWrite32(base, ctx.r3.u32, 0); GWrite32(base, ctx.r3.u32 + 4, 0); GWrite32(base, ctx.r3.u32 + 8, 0); }
+    if (ctx.r4.u32) GWrite32(base, ctx.r4.u32, 0);
+    ctx.r3.u32 = 0;                                              // false: nothing persisted
+}
+
+// Timeline dump (TTT2_TIMELINE=1): the last 3 seconds of events to C:/ttt2/port/timeline.txt.
+void timeline::PollDumpTrigger()
+{
+    if (GetFileAttributesA("C:/ttt2/port/timeline.trigger") == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA("C:/ttt2/port/timeline.trigger");
+    const uint64_t end = Next().load(), now = NowUs();
+    const uint64_t first = end > kEntries ? end - kEntries : 0;
+    FILE* f = std::fopen("C:/ttt2/port/timeline.txt", "w");
+    if (!f) return;
+    uint64_t start = first;
+    while (start < end && Ring()[start & (kEntries - 1)].us + 3000000 < now) ++start;
+    const uint64_t t0 = start < end ? Ring()[start & (kEntries - 1)].us : now;
+    for (uint64_t i = start; i < end; ++i)
+    {
+        const Entry& e = Ring()[i & (kEntries - 1)];
+        std::fprintf(f, "%llu t%u %s %c %08X\n", (unsigned long long)(e.us - t0), e.thread, Name(e.event), e.phase, e.value);
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[timeline] %llu events written to C:/ttt2/port/timeline.txt\n", (unsigned long long)(end - start));
+}

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TTT2 Local Console — Operator</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #14161a; color: #e8e8ea; font-family: system-ui, sans-serif; padding: 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1100px; }
+  .card { background: #1d2026; border: 1px solid #2c3038; border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; color: #cfd4dc; }
+  .qr { width: 150px; height: 150px; background: #fff; border-radius: 8px; display: block; }
+  .url { font-family: monospace; font-size: 12px; color: #7fb2ff; word-break: break-all; }
+  .state { font-size: 13px; margin-top: 8px; }
+  .ok { color: #4cd47c; } .bad { color: #ff6a5e; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; min-height: 22px; }
+  .pill { border: 1px solid #3a3f49; border-radius: 8px; padding: 2px 8px; font-size: 12px; }
+  .pill.on { background: rgba(255,90,40,.5); border-color: rgba(255,120,80,.8); }
+  .dpad { font-size: 13px; color: #9aa0aa; }
+  button { background: #2b3b55; color: #fff; border: 1px solid #3d5275; border-radius: 8px;
+           padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #354a6c; }
+  input { background: #14161a; border: 1px solid #3a3f49; color: #e8e8ea; border-radius: 8px;
+          padding: 8px 10px; font-size: 13px; width: 380px; font-family: monospace; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .file { font-family: monospace; font-size: 12px; color: #9aa0aa; padding: 3px 0; }
+  .hint { color: #9aa0aa; font-size: 12px; margin-top: 10px; line-height: 1.5; }
+  code { color: #7fb2ff; }
+</style>
+</head>
+<body>
+<h1>🎮 TTT2 Local Console — Operator</h1>
+<div class="sub">Laptop launcher · Player entry routes: <code>/player1</code> … <code>/player4</code> only</div>
+
+<div class="grid" id="playerCards"></div>
+
+<div class="grid" style="margin-top: 16px;">
+  <div class="card">
+    <h2>Game files (C:\TEKKEN\game_files)</h2>
+    <div id="files" class="file">…</div>
+    <div class="hint">Place your <b>own legally obtained</b> Xbox 360 disc image (.iso) of
+      Tekken Tag Tournament 2 (USA/EU) and <b>Title Update 3</b> in that folder, then run the port's
+      <code>ttt2_setup.exe</code> and point it at them. The port ships no game data and this system
+      never downloads game files.</div>
+  </div>
+  <div class="card">
+    <h2>Game control</h2>
+    <div class="row">
+      <input id="exe" placeholder="Path to the port's game .exe (set in console\settings.json)">
+      <button onclick="startGame()">Start game</button>
+      <button onclick="stopGame()">Stop game</button>
+    </div>
+    <div class="state" id="gameState">…</div>
+    <div class="hint">Start the game only after all players are connected and READY.
+      Set the exe path in <code>console\settings.json</code> as {"game_exe": "C:\\path\\to\\game.exe"}.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const arrows = { "0,0": "·", "-1,0": "←", "1,0": "→", "0,-1": "↑", "0,1": "↓",
+  "-1,-1": "↖", "1,-1": "↗", "-1,1": "↙", "1,1": "↘" };
+
+const SLOTS = ["player1", "player2", "player3", "player4"];
+const slotsShown = new Set();
+
+function slotNum(slot) { return slot.replace("player", ""); }
+
+function ensureCard(slot) {
+  if (slotsShown.has(slot)) return;
+  slotsShown.add(slot);
+  const i = slotNum(slot);
+  const div = document.createElement("div");
+  div.className = "card";
+  div.innerHTML = `
+    <h2>Player ${i}</h2>
+    <img class="qr" id="qr${i}" alt="Player ${i} QR">
+    <div class="url" id="url${i}"></div>
+    <div class="state" id="st${i}">…</div>
+    <div class="buttons" id="b${i}"></div>
+    <div class="dpad" id="d${i}"></div>`;
+  document.getElementById("playerCards").appendChild(div);
+}
+
+function playerCard(slot, p) {
+  const i = slotNum(slot);
+  document.getElementById("st" + i).innerHTML =
+    p.connected ? `<span class="ok">● connected</span> ${p.ready ? '<span class="ok">· READY</span>' : '· not ready'}`
+                : '<span class="bad">○ not connected</span>';
+  document.getElementById("b" + i).innerHTML =
+    p.buttons.length ? p.buttons.map(b => `<span class="pill on">${b}</span>`).join("") : "";
+  document.getElementById("d" + i).textContent =
+    "D-pad " + arrows[(p.dpad.x) + "," + (p.dpad.y)];
+}
+
+async function tick() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    for (const slot of Object.keys(s.qr)) {
+      ensureCard(slot);
+      const i = slotNum(slot);
+      document.getElementById("url" + i).textContent = s.url + "/" + slot;
+      document.getElementById("qr" + i).src = s.qr[slot];
+      playerCard(slot, s.players[slot]);
+    }
+    const f = document.getElementById("files");
+    f.innerHTML = s.game_files.length
+      ? s.game_files.map(x => `${x.name} <span style="color:#4cd47c">(${(x.bytes / 1e9).toFixed(2)} GB)</span>`).join("<br>")
+      : '<span style="color:#ff6a5e">No game files detected yet.</span>';
+    document.getElementById("gameState").innerHTML = s.game_running
+      ? '<span class="ok">● game running</span>' : '○ game not running';
+    if (s.game_exe && !document.getElementById("exe").value)
+      document.getElementById("exe").value = s.game_exe;
+  } catch (e) { /* server briefly unavailable; keep last state */ }
+}
+
+async function startGame() {
+  const r = await (await fetch("/api/game/start", { method: "POST" })).json();
+  if (r.error) alert(r.error);
+  tick();
+}
+async function stopGame() {
+  await fetch("/api/game/stop", { method: "POST" });
+  tick();
+}
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,251 @@
+# TESTING.md
+
+Hardware, versions, settings, and measurements recorded from the actual machine.
+Nothing here is guessed — empty rows mean "not yet measured".
+
+---
+
+## Hardware inventory (recorded 2026-11-11 via systeminfo/wmic)
+
+| Item | Value |
+|---|---|
+| Model | ASUS VivoBook X515EA |
+| CPU | Intel Core i3-1115G4, 11th gen, 2C/4T, 3.00 GHz |
+| GPU | Intel UHD Graphics (integrated only) |
+| RAM | 8 GB (2×4 GB, DDR4-3200) |
+| OS | Windows 11 Home 64-bit, build 22621 (22H2) |
+| Storage | not yet recorded |
+| Toolchain | Git 2.52, Python 3.12.6, Node 24.22 |
+
+## Game tests
+
+| Test | Result |
+|---|---|
+| Port installer runs | not yet |
+| Game builds from disc image + TU3 | not yet (game files pending) |
+| 720p FPS / frame time | not yet |
+| Two controllers recognized | not yet |
+
+## Controller / input tests (Phase 2 skeleton, recorded 2026-11-11)
+
+| Test | Result |
+|---|---|
+| Two independent slots, separate state (P1: A / P2: B+dpad) | PASS |
+| Browser pointerdown on A → server state `["A"]` | PASS |
+| Browser pointerup → server state cleared | PASS |
+| D-pad diagonal right-up → `{x:1, y:-1}` | PASS |
+| pointercancel → dpad released to `{0,0}` | PASS |
+| Malformed JSON / unknown type / unknown button rejected | PASS |
+| Disconnect releases all buttons of that slot only | PASS |
+| Wrong-token takeover attempt → denied, owner state intact | PASS |
+| Watchdog stale-client force-release | implemented, not yet measured |
+| Two real phones simultaneously | not yet |
+
+## Virtual gamepad bridge (Phase 1, recorded 2026-11-11)
+
+| Test | Result |
+|---|---|
+| ViGEm Bus driver installed (v1.22.0, service RUNNING) | PASS |
+| `vgamepad` PoC: two independent virtual Xbox 360 pads, press/release A | PASS |
+| Server startup creates both pads ("bridge: two virtual Xbox 360 pads ready") | PASS |
+| Windows PnP shows 2x "Xbox 360 Controller for Windows", Status OK | PASS |
+| Phone page press A -> WS -> server -> bridge (no exceptions) | PASS |
+| Analog nub tilt -> lx=1.0 -> bridge left stick | PASS |
+| D-pad right -> dpad x=1 -> bridge D-pad flag | PASS |
+| Release/pointerup clears buttons, sticks, dpad | PASS |
+| In-game: pads visible and usable | pending user test |
+
+## Layout editor (Phase 3, recorded 2026-11-11)
+
+| Test | Result |
+|---|---|
+| Play-mode input still works (✕ → A) | PASS |
+| EDIT enters edit mode, DONE/✎ exits | PASS |
+| Drag control → position updates (Y moved 76vw → 63vw) | PASS |
+| Size +/− resizes control | PASS |
+| Opacity slider updates live | PASS |
+| Hide button (TAG) → ghosted, hidden in play mode | PASS |
+| SAVE persists layout via POST /api/config/{slot} | PASS (verified from /api/session) |
+| Reset-to-default via /api/template | implemented, smoke-tested |
+| Two phones editing at once | not yet |
+
+## Server tests
+
+| Test | Result |
+|---|---|
+| `/`, `/player1`, `/player2` return 200 HTML | PASS |
+| `/api/status` returns LAN IP + QR data URLs | PASS (IP 10.136.37.217 at test time) |
+| QR codes render on operator dashboard | PASS (screenshot) |
+| Operator dashboard live input mirror | PASS (screenshot) |
+
+## Bugs found and fixed during testing
+
+1. `websockets` 16.0 incompatible with uvicorn 0.30.6 → pinned `websockets==12.0`.
+2. WebSocket route was defined but never registered → 403; added `@app.websocket("/ws/{slot}")`.
+3. Missing `await ws.accept()` before first receive → HTTP 500; added.
+4. `/player1`, `/player2` returned JSON-encoded HTML → added `response_class=HTMLResponse`.
+
+## Latency / performance measurements
+
+| Metric | Value |
+|---|---|
+| Phone → server RTT | not yet |
+| End-to-end touch → action | not yet |
+| Game FPS | not yet |
+
+## Network notes
+
+- Server binds `0.0.0.0`, port configurable (default 8000).
+- LAN IPv4 discovered at runtime and shown on the operator dashboard.
+- Phones must be on the same Wi-Fi; guest networks/client isolation will break
+  connectivity (error surfaced to the user).
+
+## Phase 3+1 follow-up: controller UX and 4-player
+
+| Check | Result |
+|---|---|
+| End-to-end: phone A press attacks in a live fight | PASS (screenshot 	ools/game_window4.png) |
+| "Press START" screens ignore all buttons except START | CONFIRMED (not a bug in our chain; START pill passes them) |
+| Landscape coords used when window is landscape | PASS (START 56/92, A 86/74, circle 93/64, dpad 17/73) |
+| Analog nub honours landscape coords | FIXED (ensureLandscape now creates layout.nub; nub 15/42) |
+| D-pad left arm visible in landscape | PARTIAL (xL 17 still clips slightly on 912x670 window; needs xL ~= 22 - to verify on a real phone) |
+| Fullscreen button (opens in Review pane) | PRESENT, auto-fullscreen on first touch added |
+| /player3 and /player4 routes | PASS (200, session API returns slots) |
+| Four virtual pads created at startup | PASS ("bridge: 4 virtual Xbox 360 pads ready") |
+| XInput sees 4 connected users | PASS (user0..user3 CONNECTED via xinput9_1_0 read-back) |
+| Operator dashboard shows 4 QR cards | PASS (rendered dynamically from /api/status) |
+
+Notes:
+
+- Pads assign "by use": whoever presses first at the game's start screens is
+  player 1. In Team Battle the pad was claimed by the Player2 side; players
+  should press in the order the game lists them, or we swap in the bridge.
+- Mystery drift: idle pads report lx=-3356 ly=-1869 on some users; magnitude
+  ~10%, under the game's deadzone, and control was proven - benign so far.
+- Same-token connections (phone + browser tab) share one PlayerState and take
+  over each other; harmless for input, noisy in logs.
+- Port test hook: writing C:\ttt2\port\pad_inject.txt ("START 400", "P2+START
+  150", "P3", "P4" supported) injects presses - consumed then deleted by the game.
+
+## Controller reliability + editor fixes (round 2)
+
+| Check | Result |
+|---|---|
+| Two buttons pressed together both reach the server | PASS (server held [A, B], both released cleanly) |
+| Fat-finger tap 10px outside a button still registers | PASS (nearest-control fallback, 16px margin) |
+| START pill selectable in editor | FIXED (edit panel was covering it; panel no longer blocks, rect fallback finds controls under it) |
+| START pill size change in editor | PASS (72px to 80px via Size +; size number shown) |
+| Pill drag in editor | PASS (56vw to 66vw) |
+| touch-action:none on all elements | FIXED (was only on body - not inherited; browser gesture handling cancelled multi-finger presses) |
+| Panel collapse button ("panel \u25BE") | ADDED |
+| Tap flash on very quick taps | ADDED (release sent instantly; visual lingers 90ms) |
+| Haptic buzz on press | ADDED (navigator.vibrate) |
+| Wake Lock on first touch | ADDED (phone screen stays on during play) |
+
+Notes:
+- If presses still occasionally miss on a real phone, the takeover cycle when
+  the same slot is opened twice (phone + browser tab) looks similar in logs -
+  close duplicate tabs.
+
+## Editor + overlap + combo fixes (round 3)
+
+| Check | Result |
+|---|---|
+| Selection outline no longer vanishes after Size +/- (build() kept selection) | FIXED + PASS (A stayed selected, size grew, outline stayed) |
+| RB selectable in editor | FIXED (EDIT button moved to top-centre in edit mode; was sitting on RB) |
+| Overlapping buttons: touch inside two circles presses the NEAREST one | PASS (touch between A and B but closer to A pressed exactly A; old code pressed the topmost) |
+| Two fingers on two overlapping buttons press both | PASS (per-finger nearest-control resolution) |
+| Combo creation: tap "+ COMBO", pick A and B, Finish | PASS (pill "A+B" created) |
+| Combo pill press | PASS (server held [A, B] together, clean release) |
+| Delete combo button | ADDED (shows only when a combo is selected) |
+
+Notes:
+- Combos are phone-side expansions: the combo pill sends one press message per
+  member button, so the server and game need no changes.
+- Combos persist in the slot layout JSON after SAVE; they are deleted with
+  "Delete combo" + SAVE.
+
+## PPSSPP-parity custom controls (round 4)
+
+| Check | Result |
+|---|---|
+| "+ BUTTON" creates a custom pill bound to a picked action | PASS (Y-only pill) |
+| Custom pill rename via name field | PASS (renamed to "WALL") |
+| Toggle mode on a custom pill | PASS (first tap held Y on the server, second tap released) |
+| Delete custom pill | PASS (removed; face/system buttons offer no delete) |
+| Custom buttons are entries in the slot layout JSON | BY DESIGN (persist on SAVE; server protocol unchanged - phone expands to member presses) |
+
+Editor controls now shown when a custom button is selected: Size +/-, Hide,
+Delete, name field + "Set name", "Toggle: ON/off". System buttons (A/B/X/Y/LB/
+RB/START/BACK/TAG) can be hidden or resized but not deleted.
+
+## Spec compliance round: source-counted release (PPSSPP spec 4.4/4.3/12)
+
+Input model change: the phone now keeps output name -> Set(source token).
+Each finger press (plain or combo) registers a token per affected output; a
+release only sends "release" when that token was the output's last source.
+Releasing everything (edit entry, hide, unload, WS close) clears all sources
+and sends the slot-wide release message.
+
+| Test (spec ref) | Result |
+|---|---|
+| 4.4 Two controls mapped to same output (combo A+B + plain A), releasing one | PASS (A stayed held by the other finger, B released) |
+| 4.3 Three fingers: dpad RIGHT + combo A+B + plain A | PASS (RIGHT + A + B held) |
+| 4.3 Combo finger releases while others hold | PASS (RIGHT + A remain, B gone) |
+| 12 Full release after all fingers up | PASS (empty buttons, dpad 0,0) |
+| 7 lostpointercapture wired to release path | DONE (idempotent with pointerup) |
+| Toggle buttons now source-counted too | DONE (toggle holds a token until second tap or release-all) |
+
+## Overlap tap presses BOTH buttons (multi-hit)
+
+Layout change for the test: A moved 3vw left over B (memory-only, not saved).
+Tap points measured with getBoundingClientRect.
+
+| Check | Result |
+|---|---|
+| Tap in the lens where A and B overlap | PASS (server held A + B) |
+| Release after overlap tap | PASS (clean zero) |
+| Tap on B's exclusive area (not inside A) | PASS (only B) |
+| Tap on A's exclusive area (not inside B) | PASS (only A) |
+| Tap 10px outside B (fat-finger fallback) | PASS (nearest = B) |
+| Edit-mode tap in the same lens | PASS (selects exactly 1 control, nearest center) |
+
+Note: B's *centre* still sits inside A's rect in this test layout, so a centre
+tap pressing both is correct behaviour, not a bug - only the 3vw strip on
+B's right side is exclusive.
+
+## Auto-save, continuous Size +/-, D-pad gap (round 5)
+
+| Check | Result |
+|---|---|
+| Edit change auto-saves to server (no SAVE press) | PASS (dpad gap 0->1.5 and button size 23 persisted in /api/session layout ~1s after the change) |
+| Layout mirrored to phone localStorage | PASS (ttt2-layout-player3 written on every save) |
+| Reset to default auto-saves | PASS (saved layout == template afterwards) |
+| Size + held: continuous repeat | PASS (16 -> 22 in ~1.2s hold, 140ms steps) |
+| Size + single tap: exactly one step | PASS (+1) |
+| Gap + hold spreads dpad arms | PASS (up arm top 2% -> 3.5%) |
+| Gap controls only visible when dpad selected | PASS |
+| Gap readout updates while changing | PASS (after fix: gapVal refreshes in gapSelected) |
+
+Notes: browser drag test ran in landscape (updates xL/yL), so portrait x
+stayed 76 = template default; gap/size saves prove the auto-save path.
+
+## Landscape + fullscreen play gate (round 6)
+
+A full-screen gate now blocks the controller until the phone is landscape AND
+fullscreen (a "Continue without fullscreen" link appears only if the browser
+refuses the fullscreen request, e.g. iOS Safari).
+
+| Check | Result |
+|---|---|
+| Landscape but not fullscreen: gate shown ("One more step: fullscreen") | PASS |
+| Portrait viewport (420x880 iframe): gate shown ("Turn your phone sideways") | PASS |
+| Touches blocked while gated (server buttons stay empty) | PASS (both cases) |
+| Unlock (fullscreen granted / bypass link) -> input works | PASS (A reached server) |
+| Gating does not appear while the connecting/unreachable overlay is up | BY DESIGN (gate defers, then shows on ws open) |
+
+Untested here (no way to resize the desktop window): rotating to portrait
+mid-play re-locks the gate and releases all held outputs (code path
+checkGate -> releaseAllLocal on ungated->gated transition). To verify on a
+real phone: hold a button, rotate to portrait, gate must appear and the game
+must see the button released; rotate back to resume.

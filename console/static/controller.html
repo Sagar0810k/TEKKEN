@@ -1,0 +1,1085 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>TTT2 Controller</title>
+<style>
+  :root { color-scheme: dark; }
+  /* touch-action is NOT inherited: every element must forbid browser gestures,
+     or two-finger presses get cancelled mid-tap ("clicks don't register"). */
+  * { margin: 0; padding: 0; box-sizing: border-box; touch-action: none;
+      -webkit-tap-highlight-color: transparent; }
+  html, body {
+    height: 100%; overflow: hidden; color: #e8e8ea;
+    font-family: system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; overscroll-behavior: none;
+    background: radial-gradient(120% 90% at 50% 108%, #23262c 0%, #14161a 55%, #0c0d10 100%);
+  }
+  #stage { position: relative; width: 100vw; height: 100vh; }
+
+  /* ================= buttons (PPSSPP-style, polished) ================= */
+  .btn, .pill {
+    position: absolute; transform: translate(-50%, -50%);
+    border-radius: 50%;
+    border: 1.5px solid rgba(255,255,255,.3);
+    background:
+      radial-gradient(circle at 32% 26%, rgba(255,255,255,.17), rgba(255,255,255,.03) 65%),
+      rgba(20,22,26,.55);
+    box-shadow: 0 5px 14px rgba(0,0,0,.5), inset 0 1px 1px rgba(255,255,255,.14);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-weight: 700; opacity: var(--op, .75);
+    will-change: transform, background-color; z-index: 5;
+  }
+  .btn.pressed, .pill.pressed {
+    background:
+      radial-gradient(circle at 32% 26%, rgba(255,255,255,.3), rgba(255,255,255,.07) 65%),
+      color-mix(in srgb, var(--c, #ffffff) 46%, rgba(20,22,26,.6));
+    box-shadow: 0 0 20px color-mix(in srgb, var(--c, #ffffff) 70%, transparent),
+                0 0 0 3px color-mix(in srgb, var(--c, #ffffff) 35%, transparent),
+                0 3px 8px rgba(0,0,0,.5);
+    transform: translate(-50%, -50%) scale(.88);
+  }
+  .face .glyph { font-size: 55%; line-height: 1; font-weight: 400; }
+  .ps-cross    { --c: #9fc6ff; } .ps-cross    .glyph { color: var(--c); }
+  .ps-circle   { --c: #ff8d8d; } .ps-circle   .glyph { color: var(--c); }
+  .ps-square   { --c: #ffa8e2; } .ps-square   .glyph { color: var(--c); }
+  .ps-triangle { --c: #8ce8cb; } .ps-triangle .glyph { color: var(--c); }
+
+  .pill {
+    border-radius: 999px; letter-spacing: 1px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.03)),
+      rgba(20,22,26,.55);
+    --c: #dfe3e9; color: #eef1f5;
+  }
+  .pill.tag  { --c: #ffd37a; color: #ffd37a; }
+  .pill.menu { --c: #bfc6cf; color: #dfe3e9; }
+  .pill.combo { --c: #7fd7ff; color: #7fd7ff; }
+  .picked { outline: 2px dashed #7fd7ff; outline-offset: 4px; }
+
+  /* ================= D-pad ================= */
+  #dpad { position: absolute; transform: translate(-50%, -50%); opacity: var(--op, .75); z-index: 5; }
+  .arm {
+    position: absolute; border-radius: 26%;
+    border: 1.5px solid rgba(255,255,255,.3);
+    background:
+      radial-gradient(circle at 32% 26%, rgba(255,255,255,.15), rgba(255,255,255,.02) 65%),
+      rgba(20,22,26,.55);
+    box-shadow: 0 4px 10px rgba(0,0,0,.45), inset 0 1px 1px rgba(255,255,255,.12);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 3.4vmin; color: rgba(255,255,255,.85);
+  }
+  .arm.pressed {
+    background: rgba(255,255,255,.32);
+    box-shadow: 0 0 16px rgba(255,255,255,.6), 0 3px 8px rgba(0,0,0,.5);
+  }
+
+  /* ================= analog nub ================= */
+  .stick {
+    position: absolute; transform: translate(-50%, -50%);
+    border-radius: 50%; border: 1.5px solid rgba(255,255,255,.3);
+    background: radial-gradient(circle at 40% 35%, rgba(255,255,255,.1), rgba(255,255,255,.02) 70%),
+                rgba(20,22,26,.55);
+    box-shadow: 0 5px 14px rgba(0,0,0,.5);
+    opacity: var(--op, .75); z-index: 5;
+  }
+  .stick .knob {
+    position: absolute; left: 50%; top: 50%; width: 52%; height: 52%;
+    transform: translate(-50%, -50%); border-radius: 50%;
+    background: radial-gradient(circle at 38% 32%, rgba(255,255,255,.28), rgba(255,255,255,.08) 75%);
+    border: 1.5px solid rgba(255,255,255,.35);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,.2), 0 3px 8px rgba(0,0,0,.5);
+  }
+  .stick.active .knob { background: radial-gradient(circle at 38% 32%, rgba(255,255,255,.4), rgba(255,255,255,.12) 75%); }
+
+  /* ================= editor ================= */
+  .selected { outline: 2px dashed #4cd47c; outline-offset: 4px; }
+  body.editing .btn, body.editing .pill, body.editing .stick, body.editing #dpad { cursor: move; }
+  .ghost { opacity: calc(var(--op, .75) * .22) !important; }
+
+  #fsBtn {
+    position: absolute; top: 34px; left: 12px; padding: 10px 14px;
+    border-radius: 12px; border: 2px solid rgba(255,255,255,.3);
+    background: rgba(255,255,255,.08); color: #fff; font-size: 14px; font-weight: 700; z-index: 20;
+  }
+  #editBtn {
+    position: absolute; top: 34px; right: 110px; padding: 10px 14px;
+    border-radius: 12px; border: 2px solid rgba(255,255,255,.3);
+    background: rgba(255,255,255,.08); color: #fff; font-size: 13px; font-weight: 700; z-index: 20;
+  }
+  body.editing #editBtn {
+    left: 50%; right: auto; transform: translateX(-50%);
+    background: rgba(76,212,124,.5); border-color: rgba(90,230,140,.8);
+  }
+  #readyBtn {
+    position: absolute; top: 34px; right: 12px; padding: 10px 16px;
+    border-radius: 12px; border: 2px solid rgba(255,255,255,.3);
+    background: rgba(255,255,255,.08); color: #fff; font-size: 14px; font-weight: 700; z-index: 20;
+  }
+  body.editing #readyBtn { display: none; }
+  body.editing #fsBtn { display: none; }
+  #readyBtn.on { background: rgba(60,200,110,.6); border-color: rgba(90,230,140,.8); }
+
+  #editPanel {
+    position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+    width: min(92vw, 560px); padding: 10px 14px; border-radius: 14px;
+    background: rgba(16,18,22,.92); border: 1px solid #2c3038; z-index: 30;
+    display: none; flex-direction: column; gap: 8px; font-size: 13px;
+  }
+  body.editing #editPanel { display: flex; }
+  body.editing #editPanel.collapsed { display: none; }
+  #panelBtn {
+    position: absolute; bottom: 10px; right: 12px; padding: 10px 14px;
+    border-radius: 12px; border: 2px solid rgba(255,255,255,.3);
+    background: rgba(76,212,124,.5); color: #fff; font-size: 12px; font-weight: 700;
+    z-index: 31; display: none;
+  }
+  body.editing #panelBtn { display: block; }
+  #editPanel .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #editPanel .name { color: #9aa0aa; min-width: 70px; font-weight: 700; }
+  #editPanel button {
+    padding: 7px 12px; border-radius: 10px; border: 1px solid #3a3f49;
+    background: #23262d; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer;
+  }
+  #editPanel button.primary { background: #2b5b3f; border-color: #3d8a5c; }
+  #editPanel button.warn { background: #5b2b2b; border-color: #8a3d3d; }
+  #editPanel input[type=range] { flex: 1; min-width: 120px; }
+  #selName { color: #4cd47c; font-weight: 800; }
+  #sizeVal { color: #7fb2ff; font-weight: 700; }
+
+  /* ================= top bar / overlay ================= */
+  #topbar {
+    position: absolute; top: 0; left: 0; right: 0; display: flex;
+    justify-content: space-between; align-items: center; padding: 8px 12px;
+    font-size: 13px; color: #9aa0aa; pointer-events: none; z-index: 20;
+  }
+  #status b { color: #4cd47c; }
+  #status.bad b { color: #ff6a5e; }
+  #hint {
+    position: absolute; left: 50%; top: 78px; transform: translateX(-50%);
+    max-width: 88vw; padding: 8px 14px; border-radius: 10px;
+    background: rgba(16,18,22,.85); border: 1px solid #3a3f49;
+    color: #ffd37a; font-size: 12px; z-index: 20; pointer-events: none;
+    transition: opacity .5s; opacity: 0;
+  }
+  #hint.show { opacity: 1; }
+  #overlay {
+    position: fixed; inset: 0; background: rgba(10,10,12,.88); display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+    text-align: center; z-index: 50;
+  }
+  #overlay.show { display: flex; }
+  #overlay h2 { font-size: 20px; }
+  #overlay p { color: #9aa0aa; font-size: 14px; max-width: 82vw; }
+  #gate {
+    position: fixed; inset: 0; background: rgba(8,9,11,.97); display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    text-align: center; z-index: 90;
+  }
+  #gate.show { display: flex; }
+  #gate h2 { font-size: 22px; margin: 0; }
+  #gate p { color: #9aa0aa; font-size: 14px; max-width: 82vw; margin: 0; }
+  #gateBtn {
+    padding: 14px 28px; font-size: 16px; border-radius: 12px;
+    border: 1px solid #3a3f49; background: #1c2027; color: #fff; font-weight: 700;
+  }
+  #gateSkip {
+    display: none; color: #7fd7ff; font-size: 13px; background: none;
+    border: none; text-decoration: underline; padding: 6px;
+  }
+  #gateSkip.show { display: block; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="topbar">
+    <span id="label"></span>
+    <span id="status"><b>connecting…</b></span>
+  </div>
+  <button id="fsBtn">⛶</button>
+  <button id="readyBtn">READY</button>
+  <button id="editBtn">✎ EDIT</button>
+  <button id="panelBtn">panel ▾</button>
+  <div id="hint"></div>
+  <div id="editPanel">
+    <div class="row">
+      <span class="name">Selected: <span id="selName">none</span></span>
+      <span id="sizeVal"></span>
+      <button id="szDown">Size −</button>
+      <button id="szUp">Size +</button>
+      <button id="hideBtn">Hide</button>
+      <button id="gapDown" style="visibility:hidden">Gap −</button>
+      <button id="gapUp" style="visibility:hidden">Gap +</button>
+      <span id="gapVal" style="color:#9aa0aa"></span>
+    </div>
+    <div class="row">
+      <span class="name">Opacity</span>
+      <input type="range" id="opSlider" min="20" max="95" value="75">
+      <span id="opVal">75%</span>
+    </div>
+    <div class="row">
+      <button id="saveBtn" class="primary">SAVE layout</button>
+      <button id="resetBtn" class="warn">Reset to default</button>
+      <button id="comboAdd">＋ BUTTON</button>
+      <button id="comboDone" class="primary" style="display:none">Finish</button>
+      <button id="comboCancel" style="display:none">Cancel</button>
+      <button id="delBtn" class="warn" style="visibility:hidden">Delete</button>
+      <input id="nameInput" placeholder="custom name" maxlength="10"
+             style="width:110px; padding:6px 8px; border-radius:8px; border:1px solid #3a3f49; background:#14161a; color:#fff; font-size:12px; visibility:hidden;">
+      <button id="nameSet" style="visibility:hidden">Set name</button>
+      <button id="toggleBtn" style="visibility:hidden">Toggle: off</button>
+      <button id="doneBtn">Done</button>
+      <span id="editHint" style="color:#9aa0aa">Drag a control to move it</span>
+    </div>
+  </div>
+</div>
+<div id="overlay">
+  <h2 id="ovTitle">Connecting…</h2>
+  <p id="ovText"></p>
+</div>
+<div id="gate">
+  <h2 id="gateTitle">Turn your phone sideways</h2>
+  <p id="gateText">Hold the phone in landscape and enable fullscreen to play and set up your controls.</p>
+  <button id="gateBtn">⛶ Go fullscreen</button>
+  <button id="gateSkip">Continue without fullscreen</button>
+</div>
+<script>
+"use strict";
+// Player slot comes from the URL: /player1 .. /player4
+const slot = location.pathname.replace(/\/+$/, "").split("/").pop();
+const stage = document.getElementById("stage");
+const statusEl = document.getElementById("status");
+const readyBtn = document.getElementById("readyBtn");
+const editBtn = document.getElementById("editBtn");
+const fsBtn = document.getElementById("fsBtn");
+const panelBtn = document.getElementById("panelBtn");
+const hintEl = document.getElementById("hint");
+const overlay = document.getElementById("overlay");
+const ovTitle = document.getElementById("ovTitle");
+const ovText = document.getElementById("ovText");
+document.getElementById("label").textContent = slot.toUpperCase();
+
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.classList.add("show");
+  clearTimeout(showHint._t);
+  showHint._t = setTimeout(() => hintEl.classList.remove("show"), ms || 5000);
+}
+
+// PSP-style skin: logical action -> display glyph / class / press color
+const SKIN = {
+  A:  { glyph: "\u2715", cls: "btn face ps-cross",    color: "#9fc6ff" },
+  B:  { glyph: "\u25CB", cls: "btn face ps-circle",   color: "#ff8d8d" },
+  X:  { glyph: "\u25A1", cls: "btn face ps-square",   color: "#ffa8e2" },
+  Y:  { glyph: "\u25B3", cls: "btn face ps-triangle", color: "#8ce8cb" },
+  LB: { glyph: "L",  cls: "pill", color: "#dfe3e9" },
+  RB: { glyph: "R",  cls: "pill", color: "#dfe3e9" },
+  START: { glyph: "START",  cls: "pill menu", color: "#bfc6cf" },
+  BACK:  { glyph: "SELECT", cls: "pill menu", color: "#bfc6cf" },
+  TAG:   { glyph: "TAG",    cls: "pill tag",  color: "#ffd37a" },
+};
+
+// Landscape defaults: used to fill missing landscape coords on old layouts.
+const LAND_DEFAULTS = {
+  buttons: { A: [86, 74], B: [93, 64], X: [79, 64], Y: [86, 54],
+             LB: [10, 12], RB: [90, 12], START: [56, 92], BACK: [43, 92], TAG: [70, 92] },
+  dpad: { x: 20, y: 73 }, nub: { x: 15, y: 42 },
+};
+
+let ws = null, layout = null, ready = false, connected = false;
+let mode = "play";                    // "play" | "edit"
+let selected = null;                  // {type:'btn'|'dpad'|'stick', key}
+const btnEls = new Map();             // logical button -> element
+const activePointers = new Map();     // pointerId -> {type, el, name, key, downAt}
+let dpadEl = null, curDirs = { x: 0, y: 0 };
+let nub = null, nubKnob = null, nubLast = { x: 0, y: 0 };
+// Source-counted outputs (spec 4.4): output name -> Set of source tokens.
+// An output is pressed while >= 1 source holds it; releasing one finger's
+// token only releases the output when it was that finger's last source.
+const outputSources = new Map();
+const toggleState = new Map();            // custom button name -> its source token
+let srcSeq = 0;
+
+function showOverlay(title, text) {
+  ovTitle.textContent = title; ovText.textContent = text || "";
+  overlay.classList.add("show");
+}
+function hideOverlay() { overlay.classList.remove("show"); }
+
+// --- Play gate: the phone must be landscape + fullscreen before ANY touch
+// reaches the controls (playing or setting up). Losing either condition
+// mid-play re-locks the screen and releases every held output.
+const gate = document.getElementById("gate");
+const gateTitle = document.getElementById("gateTitle");
+const gateText = document.getElementById("gateText");
+const gateBtn = document.getElementById("gateBtn");
+const gateSkip = document.getElementById("gateSkip");
+const isFullscreen = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+let gated = true, fsBypass = false;
+function updateGateMsg() {
+  const land = isLand(), fs = isFullscreen();
+  if (land && !fs) {
+    gateTitle.textContent = "One more step: fullscreen";
+    gateText.textContent = "Tap the button below to fill the whole screen.";
+  } else if (!land && fs) {
+    gateTitle.textContent = "Turn your phone sideways";
+    gateText.textContent = "Hold the phone in landscape to play and set up your controls.";
+  } else {
+    gateTitle.textContent = "Turn your phone sideways";
+    gateText.textContent = "Hold the phone in landscape, then tap the button below for fullscreen.";
+  }
+}
+function checkGate() {
+  const ok = isLand() && (isFullscreen() || fsBypass);
+  if (ok) { gated = false; gate.classList.remove("show"); gateSkip.classList.remove("show"); return; }
+  if (overlay.classList.contains("show")) return;   // server message comes first
+  if (!gated) releaseAllLocal();                    // just lost a condition mid-play
+  gated = true;
+  updateGateMsg();
+  gate.classList.add("show");
+}
+gateBtn.addEventListener("click", async () => {
+  try { await document.documentElement.requestFullscreen(); fsBypass = false; }
+  catch { gateSkip.classList.add("show"); }         // browser refuses: offer bypass
+  checkGate();
+});
+gateSkip.addEventListener("click", () => { fsBypass = true; checkGate(); });
+window.addEventListener("resize", checkGate);
+window.addEventListener("orientationchange", checkGate);
+document.addEventListener("fullscreenchange", checkGate);
+document.addEventListener("webkitfullscreenchange", checkGate);
+
+function send(obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+// Logical outputs a control produces: a combo pill produces all members.
+function outputsOf(name) {
+  const cfg = layout.buttons.find(b => b.b === name);
+  if (cfg && Array.isArray(cfg.combo) && cfg.combo.length) return cfg.combo;
+  return [name];
+}
+// Spec 4.1/4.4: one touch contact activates several outputs; each activation
+// registers a source token per output, so overlapping mappings release safely.
+function pressOutputs(token, outputs) {
+  if (mode !== "play") return;
+  for (const o of outputs) {
+    let s = outputSources.get(o);
+    if (!s) { s = new Set(); outputSources.set(o, s); }
+    const first = s.size === 0;
+    s.add(token);
+    if (first) send({ t: "b", b: o, s: 1 });
+  }
+}
+function releaseToken(token) {
+  if (mode !== "play") { return; }
+  for (const [o, s] of [...outputSources]) {
+    if (s.delete(token) && s.size === 0) {
+      outputSources.delete(o);
+      send({ t: "b", b: o, s: 0 });
+    }
+  }
+}
+function sendDirs(x, y) {
+  if (mode !== "play") return;
+  send({ t: "d", x, y });
+}
+function sendNub() {
+  if (mode !== "play") return;
+  send({ t: "s", v: { lx: nubLast.x, ly: nubLast.y, rx: 0, ry: 0 } });
+}
+function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch {} }
+
+// ---------------------------------------------------------------------------
+// Orientation: portrait and landscape each get their own stored coordinates.
+// ---------------------------------------------------------------------------
+const isLand = () => window.innerWidth > window.innerHeight;
+function nubCfg() { return layout.nub || { x: 25, y: 88, size: 16 }; }
+
+function ensureLandscape(l) {
+  // Old saved layouts have no landscape coords: fill them with sensible defaults.
+  for (const b of l.buttons) {
+    if (b.xL === undefined) { const d = LAND_DEFAULTS.buttons[b.b] || [50, 50]; b.xL = d[0]; b.yL = d[1]; }
+  }
+  if (l.dpad.xL === undefined) { l.dpad.xL = LAND_DEFAULTS.dpad.x; l.dpad.yL = LAND_DEFAULTS.dpad.y; }
+  if (!l.nub) l.nub = { x: 25, y: 88, size: 16, xL: LAND_DEFAULTS.nub.x, yL: LAND_DEFAULTS.nub.y };
+  else if (l.nub.xL === undefined) { l.nub.xL = LAND_DEFAULTS.nub.x; l.nub.yL = LAND_DEFAULTS.nub.y; }
+}
+const px = cfg => isLand() ? (cfg.xL ?? cfg.x) : cfg.x;
+const py = cfg => isLand() ? (cfg.yL ?? cfg.y) : cfg.y;
+
+// ---------------------------------------------------------------------------
+// Build controls from the layout
+// ---------------------------------------------------------------------------
+function controlSide(v) { return v * (window.innerWidth < 500 ? 1 : 1.2); }
+
+function build() {
+  stage.querySelectorAll(".btn, .pill, #dpad, .stick").forEach(el => el.remove());
+  btnEls.clear(); activePointers.clear();   // selection survives rebuilds
+  stage.style.setProperty("--op", layout.opacity ?? 0.75);
+
+  for (const b of layout.buttons) {
+    if (b.hidden && mode !== "edit") continue;
+    const isCombo = Array.isArray(b.combo) && b.combo.length > 0;
+    const skin = SKIN[b.b] || { glyph: b.b, cls: "pill", color: "#dfe3e9" };
+    const el = document.createElement("div");
+    el.className = skin.cls + (isCombo ? " combo" : "");
+    if (b.hidden) el.classList.add("ghost");
+    const inner = document.createElement("span");
+    if (skin.cls.includes("face")) inner.className = "glyph";
+    inner.textContent = isCombo ? (b.label || b.combo.join("+")) : skin.glyph;
+    el.appendChild(inner);
+    el.style.setProperty("--c", skin.color);
+    const s = controlSide(b.size);
+    el.style.left = px(b) + "vw"; el.style.top = py(b) + "vh";
+    el.style.width = s + "vmin"; el.style.height = s + "vmin";
+    if (skin.cls.includes("face")) el.style.fontSize = Math.round(s * 0.42) + "vmin";
+    else el.style.fontSize = Math.max(1.6, Math.round(s * 0.24)) + "vmin";
+    stage.appendChild(el);
+    btnEls.set(b.b, el);
+  }
+
+  buildDpad(layout.dpad);
+  btnEls.set("DPAD", dpadEl);
+  if (mode === "edit") applySelectionHighlight();
+
+  const n = nubCfg();
+  nub = document.createElement("div");
+  nub.className = "stick";
+  nub.style.left = px(n) + "vw"; nub.style.top = py(n) + "vh";
+  const ns = controlSide(n.size);
+  nub.style.width = ns + "vmin"; nub.style.height = ns + "vmin";
+  nubKnob = document.createElement("div");
+  nubKnob.className = "knob";
+  nub.appendChild(nubKnob);
+  stage.appendChild(nub);
+}
+
+function buildDpad(d) {
+  dpadEl = document.createElement("div");
+  dpadEl.id = "dpad";
+  const side = controlSide(d.size * 1.35);
+  dpadEl.style.left = px(d) + "vw"; dpadEl.style.top = py(d) + "vh";
+  dpadEl.style.width = side + "vmin"; dpadEl.style.height = side + "vmin";
+  const mk = (name, css, glyph) => {
+    const a = document.createElement("div");
+    a.className = "arm " + name;
+    a.textContent = glyph;
+    Object.assign(a.style, css);
+    dpadEl.appendChild(a);
+  };
+  const g = Math.max(0, Math.min(12, d.gap || 0));   // arm spacing (Gap ±)
+  mk("up",    { left: "34%", top: (2 + g) + "%",   width: "32%", height: "34%" }, "▲");
+  mk("down",  { left: "34%", top: (64 - g) + "%",  width: "32%", height: "34%" }, "▼");
+  mk("left",  { left: (2 + g) + "%", top: "34%",   width: "34%", height: "32%" }, "◀");
+  mk("right", { left: (64 - g) + "%", top: "34%",  width: "34%", height: "32%" }, "▶");
+  stage.appendChild(dpadEl);
+}
+
+// ---------------------------------------------------------------------------
+// Fullscreen (auto on first touch, plus the ⛶ button) + keep the screen awake
+// ---------------------------------------------------------------------------
+async function goFullscreen() {
+  try { await document.documentElement.requestFullscreen(); } catch {}
+  try { await screen.orientation.lock("landscape"); } catch {}   // phones: keep landscape
+  keepAwake();
+}
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { keepAwake(); checkGate(); }
+});
+fsBtn.addEventListener("click", () => {
+  if (document.fullscreenElement) { document.exitFullscreen(); }
+  else goFullscreen();
+});
+let fsTried = false;
+window.addEventListener("pointerdown", () => {
+  if (fsTried) return;
+  fsTried = true;
+  goFullscreen();                 // best effort; silent if the browser refuses
+}, { once: true });
+
+// Rebuild when the phone is rotated (portrait <-> landscape)
+let lastLand = isLand();
+window.addEventListener("resize", () => {
+  if (isLand() !== lastLand) { lastLand = isLand(); build(); }
+});
+
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+const editPanel = document.getElementById("editPanel");
+const selNameEl = document.getElementById("selName");
+const sizeValEl = document.getElementById("sizeVal");
+const hideBtn = document.getElementById("hideBtn");
+const opSlider = document.getElementById("opSlider");
+const opVal = document.getElementById("opVal");
+const editHint = document.getElementById("editHint");
+
+editBtn.addEventListener("click", () => mode === "play" ? enterEdit() : exitEdit());
+panelBtn.addEventListener("click", () => {
+  editPanel.classList.toggle("collapsed");
+  panelBtn.textContent = editPanel.classList.contains("collapsed") ? "panel ▴" : "panel ▾";
+});
+// Size ± and Gap ± repeat while the button is held down (continuous resize,
+// PPSSPP-style). The selected control stays selected, so every repeat step
+// keeps applying to it until you tap a different control.
+function holdRepeat(btn, fn) {
+  let t1 = null, t2 = null;
+  const stop = () => { clearTimeout(t1); clearInterval(t2); t1 = t2 = null; };
+  btn.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    fn();
+    t1 = setTimeout(() => { t2 = setInterval(fn, 140); }, 380);
+  });
+  for (const ev of ["pointerup", "pointercancel", "pointerleave"]) btn.addEventListener(ev, stop);
+}
+holdRepeat(document.getElementById("szDown"), () => resizeSelected(-1));
+holdRepeat(document.getElementById("szUp"), () => resizeSelected(1));
+const gapDownBtn = document.getElementById("gapDown");
+const gapUpBtn = document.getElementById("gapUp");
+const gapVal = document.getElementById("gapVal");
+holdRepeat(gapDownBtn, () => gapSelected(-1));
+holdRepeat(gapUpBtn, () => gapSelected(1));
+hideBtn.addEventListener("click", toggleHide);
+opSlider.addEventListener("input", () => {
+  layout.opacity = Number(opSlider.value);
+  opVal.textContent = opSlider.value + "%";
+  stage.style.setProperty("--op", layout.opacity);
+  scheduleSave();
+});
+document.getElementById("saveBtn").addEventListener("click", () => saveLayout(false));
+document.getElementById("resetBtn").addEventListener("click", resetLayout);
+document.getElementById("doneBtn").addEventListener("click", () => exitEdit());
+
+// --- combo creation (PPSSPP-style): tap "＋ COMBO", then tap buttons to
+// --- include, then "Finish". The new pill presses them all at once.
+let picking = null;                    // Set of button names being combined
+const comboAdd = document.getElementById("comboAdd");
+const comboDone = document.getElementById("comboDone");
+const comboCancel = document.getElementById("comboCancel");
+const delBtn = document.getElementById("delBtn");
+const nameInput = document.getElementById("nameInput");
+const nameSet = document.getElementById("nameSet");
+const toggleBtn = document.getElementById("toggleBtn");
+
+function pickUI(on) {
+  comboAdd.style.display = on ? "none" : "";
+  comboDone.style.display = on ? "" : "none";
+  comboCancel.style.display = on ? "" : "none";
+}
+comboAdd.addEventListener("click", () => {
+  picking = new Set();
+  pickUI(true);
+  editHint.textContent = "Tap buttons to bind (tap again to remove), then Finish";
+});
+comboCancel.addEventListener("click", () => {
+  picking = null;
+  pickUI(false);
+  document.querySelectorAll(".picked").forEach(el => el.classList.remove("picked"));
+  editHint.textContent = "";
+});
+comboDone.addEventListener("click", () => {
+  if (!picking || picking.size === 0) { editHint.textContent = "Bind at least one button"; return; }
+  const n = 1 + layout.buttons.filter(b => Array.isArray(b.combo)).length;
+  const members = [...picking];
+  layout.buttons.push({
+    b: `COMBO${n}`, combo: members, label: members.join("+"),
+    x: 50, y: 76, xL: 50, yL: 62, size: 12,
+  });
+  picking = null;
+  pickUI(false);
+  document.querySelectorAll(".picked").forEach(el => el.classList.remove("picked"));
+  editHint.textContent = `Button [${members.join("+")}] added - drag it, rename it, then SAVE`;
+  build();
+  scheduleSave();
+});
+delBtn.addEventListener("click", () => {
+  const cfg = selectedCfg();
+  if (!cfg || !Array.isArray(cfg.combo)) return;
+  layout.buttons = layout.buttons.filter(b => b !== cfg);
+  selected = null;
+  updateSelUI();
+  editHint.textContent = "Button deleted (press SAVE to keep)";
+  build();
+  scheduleSave();
+});
+nameSet.addEventListener("click", () => {
+  const cfg = selectedCfg();
+  if (!cfg || !Array.isArray(cfg.combo)) return;
+  const v = nameInput.value.trim();
+  if (v) cfg.label = v;
+  else delete cfg.label;                       // fall back to member names
+  nameInput.value = "";
+  editHint.textContent = "Renamed (press SAVE to keep)";
+  build();
+  scheduleSave();
+});
+toggleBtn.addEventListener("click", () => {
+  const cfg = selectedCfg();
+  if (!cfg || !Array.isArray(cfg.combo)) return;
+  cfg.toggle = !cfg.toggle;
+  toggleBtn.textContent = "Toggle: " + (cfg.toggle ? "ON" : "off");
+  editHint.textContent = cfg.toggle
+    ? "Toggle ON: one tap holds, second tap releases"
+    : "Toggle off: normal press-and-hold";
+  scheduleSave();
+});
+
+function selectedCfg() {
+  if (!selected) return null;
+  if (selected.type === "btn") return layout.buttons.find(b => b.b === selected.key);
+  if (selected.type === "dpad") return layout.dpad;
+  if (selected.type === "stick") return nubCfg();
+  return null;
+}
+
+function updateSelUI() {
+  const cfg = selectedCfg();
+  selNameEl.textContent = selected ? labelOf(selected) : "none";
+  sizeValEl.textContent = cfg && cfg.size ? Math.round(cfg.size) : "";
+  hideBtn.style.visibility = selected && selected.type === "btn" ? "visible" : "hidden";
+  hideBtn.textContent = cfg && cfg.hidden ? "Show" : "Hide";
+  const isCustom = cfg && Array.isArray(cfg.combo);
+  delBtn.style.visibility = isCustom ? "visible" : "hidden";
+  nameInput.style.visibility = isCustom ? "visible" : "hidden";
+  nameSet.style.visibility = isCustom ? "visible" : "hidden";
+  toggleBtn.style.visibility = isCustom ? "visible" : "hidden";
+  toggleBtn.textContent = "Toggle: " + (cfg && cfg.toggle ? "ON" : "off");
+  const isDpad = selected && selected.type === "dpad";
+  gapDownBtn.style.visibility = isDpad ? "visible" : "hidden";
+  gapUpBtn.style.visibility = isDpad ? "visible" : "hidden";
+  gapVal.textContent = isDpad ? "gap " + Math.round(layout.dpad.gap || 0) : "";
+  if (isCustom) nameInput.placeholder = cfg.label || cfg.combo.join("+");
+  if (selected) applySelectionHighlight();
+}
+
+function labelOf(sel) {
+  if (sel.type === "dpad") return "D-PAD";
+  if (sel.type === "stick") return "ANALOG NUB";
+  return sel.key;
+}
+
+function applySelectionHighlight() {
+  document.querySelectorAll(".selected").forEach(el => el.classList.remove("selected"));
+  if (!selected) return;
+  const el = selected.type === "btn" ? btnEls.get(selected.key)
+    : selected.type === "dpad" ? dpadEl
+    : nub;
+  if (el) el.classList.add("selected");
+}
+
+function select(type, key) {
+  selected = { type, key };
+  updateSelUI();
+}
+
+function resizeSelected(dir) {
+  const cfg = selectedCfg();
+  if (!cfg) { editHint.textContent = "Tap a control first"; return; }
+  const d = dir * (selected.type === "dpad" ? 2 : 1);
+  cfg.size = Math.max(7, Math.min(40, Math.round((cfg.size + d) * 2) / 2));
+  sizeValEl.textContent = Math.round(cfg.size);
+  build();
+  scheduleSave();
+}
+
+// Spread the D-pad's four arms apart (bigger centre gap between the buttons).
+function gapSelected(dir) {
+  if (!selected || selected.type !== "dpad") return;
+  const d = layout.dpad;
+  d.gap = Math.max(0, Math.min(12, Math.round(((d.gap || 0) + dir * 1.5) * 2) / 2));
+  gapVal.textContent = "gap " + Math.round(d.gap);
+  build();
+  scheduleSave();
+}
+
+function toggleHide() {
+  if (!selected || selected.type !== "btn") return;
+  const cfg = selectedCfg();
+  cfg.hidden = !cfg.hidden;
+  build();
+  scheduleSave();
+}
+
+function enterEdit() {
+  mode = "edit";
+  document.body.classList.add("editing");
+  releaseAllLocal();
+  opSlider.value = Math.round((layout.opacity ?? 0.75) * 100);
+  opVal.textContent = opSlider.value + "%";
+  build();
+  showHint("Edit mode: drag to move, Size ± to resize. Panel hides with \"panel ▾\".", 6000);
+}
+
+function exitEdit() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveLayout(true); }
+  mode = "play";
+  picking = null;
+  pickUI(false);
+  selected = null;
+  document.body.classList.remove("editing");
+  editPanel.classList.remove("collapsed");
+  panelBtn.textContent = "panel ▾";
+  build();
+}
+
+// --- auto-save: every layout change is stored automatically (debounced) BOTH
+// on the laptop (per-slot JSON, shared with the other players) and in this
+// phone's own localStorage (survives reloads, reconnects and laptop reboots of
+// the page state). The SAVE button still forces an immediate save.
+const LS_KEY = "ttt2-layout-" + slot;
+let saveTimer = null, lastSavedJSON = "";
+function scheduleSave() {
+  if (mode !== "edit") return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveLayout(true), 800);
+}
+function snapshotJSON() { try { return JSON.stringify(layout); } catch { return ""; } }
+async function saveLayout(quiet) {
+  const json = snapshotJSON();
+  if (quiet && json === lastSavedJSON) return;      // nothing changed since
+  try {
+    const r = await fetch(`/api/config/${slot}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(layout),
+    });
+    try { localStorage.setItem(LS_KEY, json); } catch {}
+    if (r.ok) {
+      lastSavedJSON = json;
+      setStatus("", "saved");
+      if (!quiet) editHint.textContent = "Saved ✓";
+    } else editHint.textContent = "Save failed";
+  } catch { editHint.textContent = "Save failed (offline?)"; }
+}
+
+async function resetLayout() {
+  try {
+    layout = await (await fetch("/api/template")).json();
+    ensureLandscape(layout);
+    selected = null;
+    opSlider.value = Math.round((layout.opacity ?? 0.75) * 100);
+    opVal.textContent = opSlider.value + "%";
+    build();
+    await saveLayout(true);                 // auto-save the reset immediately
+    editHint.textContent = "Reset to default layout";
+  } catch { editHint.textContent = "Reset failed"; }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer handling: multi-touch in play mode; drag/select in edit mode.
+// Each finger is independent (keyed by pointerId), so two buttons pressed
+// together both register and both release.
+// ---------------------------------------------------------------------------
+stage.addEventListener("pointerdown", onDown, { passive: false });
+stage.addEventListener("pointermove", onMove, { passive: false });
+stage.addEventListener("pointerup", onUp, { passive: false });
+stage.addEventListener("pointercancel", onUp, { passive: false });
+stage.addEventListener("lostpointercapture", onUp, { passive: false });
+stage.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+window.addEventListener("gesturestart", e => e.preventDefault());
+
+// Real UI buttons / editor panel handle their own events; don't hijack them.
+function onUI(e) {
+  const t = e.target instanceof Element ? e.target : null;
+  if (!t) return false;
+  return !!(t.closest("button") || t.closest("#editPanel"));
+}
+
+function hitAll(e, single) {
+  // Overlap-aware hit testing.
+  //  - Play mode (single=false): EVERY button whose rect strictly contains the
+  //    touch is pressed, so a tap in the lens of two overlapping buttons
+  //    activates both. D-pad/stick stay single-hit, and buttons win when a
+  //    touch lands on both. Fat-finger fallback: nearest control whose rect
+  //    (with a 14px margin) contains the touch.
+  //  - Edit mode (single=true): one control, nearest CENTER wins, so taps stay
+  //    predictable while moving/sizing things.
+  const margin = 14;
+  const bx = e.clientX, by = e.clientY;
+  const btns = [];                        // buttons strictly containing the point
+  let others = null, othersD = Infinity;  // dpad/stick containing the point
+  let near = null, nearD = Infinity;      // nearest within margin (fallback)
+  const consider = (type, key, el) => {
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const d = (bx - cx) ** 2 + (by - cy) ** 2;
+    if (bx < r.left - margin || bx > r.right + margin ||
+        by < r.top - margin || by > r.bottom + margin) return;
+    if (d < nearD) { nearD = d; near = { type, key, el }; }
+    const inside = bx >= r.left && bx <= r.right && by >= r.top && by <= r.bottom;
+    if (type === "btn") {
+      if (inside) btns.push({ type, key, el });
+    } else if (inside && d < othersD) { othersD = d; others = { type, key, el }; }
+  };
+  if (dpadEl) consider("dpad", "dpad", dpadEl);
+  if (nub) consider("stick", "nub", nub);
+  for (const [name, el] of btnEls)
+    if (name !== "DPAD") consider("btn", name, el);
+  if (single) return near ? [near] : [];
+  if (btns.length) return btns;           // overlapping buttons: press them all
+  if (others) return [others];
+  return near ? [near] : [];              // fat-finger fallback
+}
+function hitControl(e) { return hitAll(e, true)[0] || null; }
+
+function onDown(e) {
+  if (gated) return;                      // landscape + fullscreen required
+  if (onUI(e)) return;                    // let real buttons work normally
+  e.preventDefault();
+  if (mode === "edit") {
+    const c = hitControl(e);
+    if (!c) return;
+    try { c.el.setPointerCapture(e.pointerId); } catch {}
+    if (picking) {
+      // Combo picking: taps toggle membership, no dragging.
+      if (c.type === "btn" && c.key !== "DPAD") {
+        if (picking.has(c.key)) { picking.delete(c.key); c.el.classList.remove("picked"); }
+        else { picking.add(c.key); c.el.classList.add("picked"); }
+        editHint.textContent = picking.size
+          ? "Bind: " + [...picking].join(" + ") + "  -  press Finish"
+          : "Tap buttons to bind (tap again to remove), then Finish";
+      }
+      return;
+    }
+    activePointers.set(e.pointerId, { type: "edit", ctrl: c, lastX: e.clientX, lastY: e.clientY });
+    select(c.type, c.type === "dpad" ? "dpad" : c.type === "stick" ? "nub" : c.key);
+    return;
+  }
+  // Play mode: a touch in the overlap lens of several buttons presses ALL of
+  // them (one token per output, so releases stay source-counted).
+  const hits = hitAll(e, false);
+  if (!hits.length) return;
+  if (hits[0].type === "dpad") {
+    try { hits[0].el.setPointerCapture(e.pointerId); } catch {}
+    activePointers.set(e.pointerId, { type: "dpad" });
+    moveDpad(e);
+    return;
+  }
+  if (hits[0].type === "stick") {
+    try { hits[0].el.setPointerCapture(e.pointerId); } catch {}
+    activePointers.set(e.pointerId, { type: "stick" });
+    moveNub(e);
+    return;
+  }
+  try { hits[0].el.setPointerCapture(e.pointerId); } catch {}
+  const token = ++srcSeq;
+  const entries = [];                     // non-toggle buttons this finger holds
+  for (const h of hits) {
+    const cfg = layout.buttons.find(b => b.b === h.key);
+    if (cfg && cfg.toggle) {
+      // PPSSPP-style toggle: first tap holds, second tap releases.
+      const tk = toggleState.get(h.key);
+      if (tk !== undefined) {
+        toggleState.delete(h.key);
+        releaseToken(tk);
+        h.el.classList.remove("pressed");
+      } else {
+        const t2 = ++srcSeq;
+        toggleState.set(h.key, t2);
+        pressOutputs(t2, outputsOf(h.key));
+        h.el.classList.add("pressed");
+      }
+      continue;
+    }
+    entries.push({ el: h.el, name: h.key });
+    h.el.classList.add("pressed");
+    pressOutputs(token, outputsOf(h.key));
+  }
+  buzz(entries.length ? 12 : 16);
+  // All-toggle touch: releases happen on the toggles' next taps, not here.
+  activePointers.set(e.pointerId, entries.length
+    ? { type: "btns", entries, token, downAt: performance.now() }
+    : { type: "toggle" });
+}
+
+function onMove(e) {
+  const a = activePointers.get(e.pointerId);
+  if (!a) return;
+  e.preventDefault();
+  if (a.type === "edit") {
+    const cfg = selectedCfg();
+    if (!cfg) return;
+    const dxVw = (e.clientX - a.lastX) / window.innerWidth * 100;
+    const dyVh = (e.clientY - a.lastY) / window.innerHeight * 100;
+    a.lastX = e.clientX; a.lastY = e.clientY;
+    if (isLand()) {
+      cfg.xL = Math.max(4, Math.min(96, Math.round(((cfg.xL ?? cfg.x) + dxVw) * 2) / 2));
+      cfg.yL = Math.max(9, Math.min(96, Math.round(((cfg.yL ?? cfg.y) + dyVh) * 2) / 2));
+    } else {
+      cfg.x = Math.max(4, Math.min(96, Math.round((cfg.x + dxVw) * 2) / 2));
+      cfg.y = Math.max(9, Math.min(96, Math.round((cfg.y + dyVh) * 2) / 2));
+    }
+    const el = a.ctrl.el;
+    el.style.left = px(cfg) + "vw"; el.style.top = py(cfg) + "vh";
+    scheduleSave();                          // debounced: saves after the drag
+    return;
+  }
+  if (a.type === "dpad") moveDpad(e);
+  else if (a.type === "stick") moveNub(e);
+}
+
+function moveDpad(e) {
+  const r = dpadEl.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const x = Math.abs(e.clientX - cx) < r.width * 0.14 ? 0 : (e.clientX < cx ? -1 : 1);
+  const y = Math.abs(e.clientY - cy) < r.height * 0.14 ? 0 : (e.clientY < cy ? -1 : 1);
+  if (x !== curDirs.x || y !== curDirs.y) {
+    curDirs = { x, y };
+    dpadEl.querySelectorAll(".arm").forEach(a => a.classList.remove("pressed"));
+    const arm = dpadEl.querySelector(
+      (x < 0 ? ".left" : x > 0 ? ".right" : "") +
+      (y < 0 ? ".up" : y > 0 ? ".down" : ""));
+    if (x === 0 && y === 0) { /* center: none lit */ }
+    else if (arm) arm.classList.add("pressed");
+    else {
+      const ax = x < 0 ? ".left" : ".right", ay = y < 0 ? ".up" : ".down";
+      dpadEl.querySelector(ax)?.classList.add("pressed");
+      dpadEl.querySelector(ay)?.classList.add("pressed");
+    }
+    sendDirs(x, y);
+  }
+}
+
+function moveNub(e) {
+  const r = nub.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const nx = Math.max(-1, Math.min(1, (e.clientX - cx) / (r.width * 0.4)));
+  const ny = Math.max(-1, Math.min(1, (e.clientY - cy) / (r.height * 0.4)));
+  const dead = v => Math.abs(v) < 0.12 ? 0 : Math.round(v * 100) / 100;
+  const x = dead(nx), y = dead(ny);
+  nubKnob.style.transform = `translate(calc(-50% + ${(nx * r.width * 0.26).toFixed(1)}px), calc(-50% + ${(ny * r.height * 0.26).toFixed(1)}px))`;
+  if (x !== nubLast.x || y !== nubLast.y) {
+    nubLast = { x, y };
+    sendNub();
+  }
+}
+
+function onUp(e) {
+  const a = activePointers.get(e.pointerId);
+  if (!a) return;
+  e.preventDefault();
+  activePointers.delete(e.pointerId);
+  if (a.type === "toggle") {
+    // toggle buttons release on their own next tap, not here
+  } else if (a.type === "btn" || a.type === "btns") {
+    releaseToken(a.token);                  // releases only this finger's sources
+    // Very short taps may never paint a frame of .pressed: keep the flash
+    // briefly so the tap is visible, without delaying the release.
+    const els = a.type === "btns" ? a.entries.map(en => en.el) : [a.el];
+    for (const el of els) {
+      if (performance.now() - (a.downAt || 0) < 130) {
+        setTimeout(() => el.classList.remove("pressed"), 90);
+      } else {
+        el.classList.remove("pressed");
+      }
+    }
+  } else if (a.type === "dpad") {
+    curDirs = { x: 0, y: 0 };
+    dpadEl.querySelectorAll(".arm").forEach(el => el.classList.remove("pressed"));
+    sendDirs(0, 0);
+  } else if (a.type === "stick") {
+    nubKnob.style.transform = "translate(-50%, -50%)";
+    nubLast = { x: 0, y: 0 };
+    sendNub();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle: heartbeat, release on hide, reconnect, slot takeover
+// ---------------------------------------------------------------------------
+function setStatus(cls, text) {
+  statusEl.className = cls || "";
+  statusEl.innerHTML = "<b>" + text + "</b>";
+}
+
+function connect() {
+  fetch(`/api/session/${slot}`)
+    .then(r => r.json())
+    .then(sess => {
+      layout = sess.layout;
+      // If the laptop has no usable layout for this slot yet, fall back to the
+      // copy this phone saved in its own storage.
+      if (!layout || !Array.isArray(layout.buttons) || !layout.buttons.length) {
+        try {
+          const cached = localStorage.getItem(LS_KEY);
+          if (cached) layout = JSON.parse(cached);
+        } catch {}
+      }
+      ensureLandscape(layout);
+      lastSavedJSON = snapshotJSON();
+      try { localStorage.setItem(LS_KEY, lastSavedJSON); } catch {}
+      build();
+      openSocket(sess.token);
+    })
+    .catch(() => showOverlay("Server unreachable",
+      "Make sure the server is running on the laptop and this phone is on the same Wi-Fi network."));
+}
+
+function openSocket(token) {
+  const proto = location.protocol === "https:" ? "wss://" : "ws://";
+  ws = new WebSocket(`${proto}${location.host}/ws/${slot}?token=${token}`);
+  ws.onopen = () => {
+    connected = true;
+    hideOverlay();
+    checkGate();                        // landscape + fullscreen required to play
+    setStatus("", "connected");
+    send({ t: "ready", v: ready });
+    if (!localStorage.getItem("hinted")) {
+      localStorage.setItem("hinted", "1");
+      showHint("Tip: screens saying \u201cPress START\u201d only react to the START pill", 7000);
+    }
+  };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.t === "denied") {
+      setStatus("bad", "slot in use");
+      showOverlay("Player slot busy",
+        "Another device is connected to " + slot + ". Ask the laptop operator to free the slot, then reload.");
+    }
+  };
+  ws.onclose = () => {
+    connected = false;
+    setStatus("bad", "reconnecting…");
+    releaseAllLocal();
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+function releaseAllLocal() {
+  // Spec 12: release-all on edit entry, disconnect, hide, unload.
+  outputSources.clear();
+  toggleState.clear();
+  send({ t: "rel" });                       // server drops every held button
+  btnEls.forEach((el, name) => { if (name !== "DPAD") el.classList.remove("pressed"); });
+  if (dpadEl) dpadEl.querySelectorAll(".arm").forEach(el => el.classList.remove("pressed"));
+  curDirs = { x: 0, y: 0 }; sendDirs(0, 0);
+  if (nub) { nubKnob.style.transform = "translate(-50%, -50%)"; nubLast = { x: 0, y: 0 }; sendNub(); }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") send({ t: "rel" }); // no stuck buttons
+});
+window.addEventListener("pagehide", () => send({ t: "rel" }));
+window.addEventListener("beforeunload", () => send({ t: "rel" }));
+setInterval(() => { if (connected) send({ t: "hb" }); }, 2000);
+
+readyBtn.addEventListener("click", () => {
+  ready = !ready;
+  readyBtn.classList.toggle("on", ready);
+  readyBtn.textContent = ready ? "READY ✓" : "READY";
+  send({ t: "ready", v: ready });
+});
+
+connect();
+</script>
+</body>
+</html>
