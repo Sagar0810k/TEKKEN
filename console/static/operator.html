@@ -2,60 +2,222 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TTT2 Local Console — Operator</title>
 <style>
-  :root { color-scheme: dark; }
+  /* ---- Fonts (vendored locally, OFL) ---- */
+  @font-face {
+    font-family: "Manrope";
+    src: url("/static/fonts/f12.woff2") format("woff2");
+    font-weight: 400 800; font-style: normal; font-display: swap;
+  }
+  @font-face {
+    font-family: "Geist Mono";
+    src: url("/static/fonts/f6.woff2") format("woff2");
+    font-weight: 400 700; font-style: normal; font-display: swap;
+  }
+
+  :root {
+    color-scheme: dark;
+    /* flat surface ramp */
+    --bg: #000000;
+    --surface: #181818;
+    --surface-2: #1F1F1F;
+    --surface-3: #272727;
+    --surface-4: #313131;
+    --text: #FFFFFF;
+    --text-2: #9B9B9B;
+    --red: #FF4D5A;
+    --blue: #4DA3FF;
+    --ok: #4CD47C;
+    --bad: #FF6A5E;
+    --amber: #FFB36B;
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #14161a; color: #e8e8ea; font-family: system-ui, sans-serif; padding: 20px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: #9aa0aa; font-size: 13px; margin-bottom: 18px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1100px; }
-  .card { background: #1d2026; border: 1px solid #2c3038; border-radius: 12px; padding: 16px; }
-  .card h2 { font-size: 15px; margin: 0 0 10px; color: #cfd4dc; }
-  .qr { width: 150px; height: 150px; background: #fff; border-radius: 8px; display: block; }
-  .url { font-family: monospace; font-size: 12px; color: #7fb2ff; word-break: break-all; }
-  .state { font-size: 13px; margin-top: 8px; }
-  .ok { color: #4cd47c; } .bad { color: #ff6a5e; }
-  .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; min-height: 22px; }
-  .pill { border: 1px solid #3a3f49; border-radius: 8px; padding: 2px 8px; font-size: 12px; }
-  .pill.on { background: rgba(255,90,40,.5); border-color: rgba(255,120,80,.8); }
-  .dpad { font-size: 13px; color: #9aa0aa; }
-  button { background: #2b3b55; color: #fff; border: 1px solid #3d5275; border-radius: 8px;
-           padding: 8px 14px; font-size: 13px; cursor: pointer; }
-  button:hover { background: #354a6c; }
-  input { background: #14161a; border: 1px solid #3a3f49; color: #e8e8ea; border-radius: 8px;
-          padding: 8px 10px; font-size: 13px; width: 380px; font-family: monospace; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .file { font-family: monospace; font-size: 12px; color: #9aa0aa; padding: 3px 0; }
-  .hint { color: #9aa0aa; font-size: 12px; margin-top: 10px; line-height: 1.5; }
-  code { color: #7fb2ff; }
+  body {
+    margin: 0; min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Manrope", system-ui, sans-serif;
+    font-size: 16px; line-height: 1.5;
+    padding: 24px clamp(16px, 3vw, 40px) 40px;
+  }
+  ::selection { background: #313131; }
+
+  /* ---- Type scale (Tailwind): 12 / 14 / 16 / 18 / 20 / 24 / 30 ---- */
+  h1 { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; margin: 0;
+       background: linear-gradient(90deg, #FFFFFF, #9B9B9B);
+       -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .head { display: flex; align-items: center; justify-content: space-between;
+          gap: 16px; flex-wrap: wrap; max-width: 1440px; margin: 0 auto 24px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand svg { flex: none; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; font-size: 14px;
+          font-weight: 600; padding: 8px 16px; border-radius: 999px;
+          background: var(--surface-2); color: var(--text-2); }
+  .chip b { color: var(--text); font-weight: 700; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--surface-4); }
+  .dot.on { background: var(--ok); }
+  .dot.game { background: var(--surface-4); }
+  .dot.game.running { background: var(--ok); }
+  .dot.red { background: var(--red); } .dot.blue { background: var(--blue); }
+
+  /* ---- Layout ---- */
+  .layout { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 16px;
+            max-width: 1440px; margin: 0 auto; }
+  @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+  .teamcol { display: flex; flex-direction: column; gap: 16px; }
+  .teamcol h2 { display: flex; align-items: center; gap: 10px; font-size: 14px;
+                font-weight: 700; letter-spacing: 0.08em; margin: 8px 0 0 4px;
+                color: var(--text-2); }
+
+  .card { background: var(--surface); border-radius: 16px; padding: 16px; }
+  .card h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 12px;
+             font-size: 14px; font-weight: 700; letter-spacing: 0.04em;
+             text-transform: uppercase; color: var(--text-2); }
+  .card h3 svg { color: var(--text); flex: none; }
+
+  /* ---- Player cards ---- */
+  .pcard .prow { display: flex; gap: 16px; align-items: flex-start; }
+  .pcard + .pcard { margin-top: 16px; }
+  .qr { width: 118px; height: 118px; background: #FFFFFF; border-radius: 8px;
+        padding: 6px; flex: none; }
+  .meta { flex: 1; min-width: 0; }
+  .pname { font-size: 18px; font-weight: 800; display: flex; align-items: center;
+           gap: 8px; margin-bottom: 2px; }
+  .tchip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+           font-weight: 700; padding: 2px 10px; border-radius: 999px;
+           background: var(--surface-3); color: var(--text-2); }
+  .tchip .dot { width: 6px; height: 6px; }
+  .url { font-family: "Geist Mono", monospace; font-size: 12px; color: var(--text-2);
+         word-break: break-all; display: flex; gap: 8px; align-items: center; }
+  .state { font-size: 14px; margin: 8px 0 4px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .dim { color: var(--text-2); }
+  .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; min-height: 24px; }
+  .pill { background: var(--surface-3); border-radius: 8px; padding: 2px 10px;
+          font-size: 12px; font-weight: 700; font-family: "Geist Mono", monospace;
+          color: var(--text); }
+  .dpad { font-size: 14px; color: var(--text-2); margin-top: 4px;
+          font-family: "Geist Mono", monospace; }
+  .dpad b { color: var(--text); }
+
+  /* ---- Center column ---- */
+  .center { display: flex; flex-direction: column; gap: 16px; }
+  ol.steps { margin: 0; padding-left: 20px; color: var(--text-2);
+             font-size: 14px; line-height: 2; }
+  ol.steps b { color: var(--text); font-weight: 700; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  input { background: var(--surface-2); border: 1px solid transparent; color: var(--text);
+          border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%;
+          min-width: 220px; font-family: "Geist Mono", monospace;
+          transition: border-color 300ms var(--ease); }
+  input:hover { border-color: var(--surface-4); }
+  input:focus { outline: none; border-color: var(--text-2); }
+  .hint { color: var(--text-2); font-size: 12px; margin-top: 12px; line-height: 1.6; }
+  code { font-family: "Geist Mono", monospace; font-size: 12px;
+         background: var(--surface-2); border-radius: 8px; padding: 1px 6px; }
+  .error { display: none; background: #2B1815; color: var(--bad); font-size: 14px;
+           font-weight: 600; border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
+  .error.show { display: block; }
+
+  /* ---- Buttons: flat, full states ---- */
+  button { font-family: inherit; font-size: 14px; font-weight: 700; color: var(--text);
+           background: var(--surface-3); border: none; border-radius: 8px;
+           padding: 10px 16px; cursor: pointer;
+           transition: transform 300ms var(--ease), opacity 300ms var(--ease),
+                       background-color 300ms var(--ease); }
+  button:hover { background: var(--surface-4); }
+  button:active { transform: scale(0.98); }
+  button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--text); color: var(--bg); }
+  button.primary:hover { background: #E5E5E5; }
+  button.danger { background: var(--surface-3); color: var(--bad); }
+  button.danger:hover { background: #2B1815; }
+  button.big { font-size: 16px; padding: 12px 24px; border-radius: 8px; }
+  .url button { padding: 4px 10px; font-size: 12px; white-space: nowrap; }
+  button svg { vertical-align: -2px; }
+
+  /* ---- Game files list ---- */
+  .file { font-family: "Geist Mono", monospace; font-size: 12px;
+          color: var(--text-2); padding: 4px 0; }
+  .file .ok { font-weight: 700; }
+
+  /* ---- Skeleton loading ---- */
+  .skeleton { background: var(--surface-2); border-radius: 8px;
+              animation: shimmer 1.6s ease-in-out infinite; }
+  @keyframes shimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .sk-qr { width: 118px; height: 118px; border-radius: 8px; flex: none; }
+  .sk-line { height: 14px; margin: 8px 0; }
+  .sk-card { background: var(--surface); border-radius: 16px; padding: 16px; }
+  .sk-card .inner { display: flex; gap: 16px; }
+  .loaded .sk-card, .loaded .skeleton { display: none; }
+
+  /* ---- Motion: transform/opacity only, reduced-motion respected ---- */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 </style>
 </head>
 <body>
-<h1>🎮 TTT2 Local Console — Operator</h1>
-<div class="sub">Laptop launcher · Player entry routes: <code>/player1</code> … <code>/player4</code> only</div>
-
-<div class="grid" id="playerCards"></div>
-
-<div class="grid" style="margin-top: 16px;">
-  <div class="card">
-    <h2>Game files (C:\TEKKEN\game_files)</h2>
-    <div id="files" class="file">…</div>
-    <div class="hint">Place your <b>own legally obtained</b> Xbox 360 disc image (.iso) of
-      Tekken Tag Tournament 2 (USA/EU) and <b>Title Update 3</b> in that folder, then run the port's
-      <code>ttt2_setup.exe</code> and point it at them. The port ships no game data and this system
-      never downloads game files.</div>
+<div class="head">
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h4M8 10v4"/><path d="M15 11h.01M18 13h.01"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.051-.011-.1-.017-.151A4 4 0 0 0 17.32 5z"/></svg>
+    <h1>TTT2 LOCAL CONSOLE</h1>
   </div>
-  <div class="card">
-    <h2>Game control</h2>
-    <div class="row">
-      <input id="exe" placeholder="Path to the port's game .exe (set in console\settings.json)">
-      <button onclick="startGame()">Start game</button>
-      <button onclick="stopGame()">Stop game</button>
+  <div class="chips">
+    <span class="chip"><span class="dot" id="srvDot"></span><span id="connCount">0/4 phones</span></span>
+    <span class="chip"><span class="dot game" id="gameDot"></span><span id="gameState">loading</span></span>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="teamcol">
+    <h2><span class="dot red"></span>RED TEAM · P1 + P2</h2>
+    <div id="cardsRed"></div>
+  </div>
+
+  <div class="center">
+    <div class="card">
+      <h3><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>Session checklist</h3>
+      <ol class="steps">
+        <li>Phones join this Wi-Fi and open <b>their player link</b> (scan the QR).</li>
+        <li>All four cards show <b>connected</b>.</li>
+        <li><b>Start the game</b> here, drive menus from P1's phone.</li>
+        <li>2v2: <b>OFFLINE MODE → PAIR PLAY</b> — full guide in the README.</li>
+      </ol>
     </div>
-    <div class="state" id="gameState">…</div>
-    <div class="hint">Start the game only after all players are connected and READY.
-      Set the exe path in <code>console\settings.json</code> as {"game_exe": "C:\\path\\to\\game.exe"}.</div>
+    <div class="card">
+      <h3><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>Game control</h3>
+      <div class="row">
+        <input id="exe" placeholder="Path to the port's game .exe (console\settings.json)">
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <button class="primary big" onclick="startGame(this)">Start game</button>
+        <button class="danger big" onclick="stopGame(this)">Stop</button>
+      </div>
+      <div class="error" id="gameError"></div>
+      <div class="hint">The exe path is read from <code>console\settings.json</code>. Start the game only
+        after the players are connected.</div>
+    </div>
+    <div class="card">
+      <h3><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>Game files (C:\TEKKEN\game_files)</h3>
+      <div id="files" class="file"><span class="skeleton sk-line" style="display:block;width:60%"></span></div>
+      <div class="hint">Place your <b>own legally obtained</b> TTT2 disc image (.iso) and
+        <b>Title Update 3</b> here, then run the port's <code>ttt2_setup.exe</code>.
+        This system never downloads game files.</div>
+    </div>
+  </div>
+
+  <div class="teamcol">
+    <h2><span class="dot blue"></span>BLUE TEAM · P3 + P4</h2>
+    <div id="cardsBlue"></div>
   </div>
 </div>
 
@@ -63,72 +225,107 @@
 "use strict";
 const arrows = { "0,0": "·", "-1,0": "←", "1,0": "→", "0,-1": "↑", "0,1": "↓",
   "-1,-1": "↖", "1,-1": "↗", "-1,1": "↙", "1,1": "↘" };
+const SLOTS = { player1:"red", player2:"red", player3:"blue", player4:"blue" };
+const shown = new Set();
 
-const SLOTS = ["player1", "player2", "player3", "player4"];
-const slotsShown = new Set();
+function slotNum(slot){ return slot.replace("player",""); }
+function teamOf(slot){ return SLOTS[slot] || "red"; }
 
-function slotNum(slot) { return slot.replace("player", ""); }
-
-function ensureCard(slot) {
-  if (slotsShown.has(slot)) return;
-  slotsShown.add(slot);
-  const i = slotNum(slot);
+function ensureCard(slot){
+  if (shown.has(slot)) return;
+  shown.add(slot);
+  const i = slotNum(slot), team = teamOf(slot);
   const div = document.createElement("div");
-  div.className = "card";
+  div.className = "card pcard loaded";
   div.innerHTML = `
-    <h2>Player ${i}</h2>
-    <img class="qr" id="qr${i}" alt="Player ${i} QR">
-    <div class="url" id="url${i}"></div>
-    <div class="state" id="st${i}">…</div>
-    <div class="buttons" id="b${i}"></div>
-    <div class="dpad" id="d${i}"></div>`;
-  document.getElementById("playerCards").appendChild(div);
+    <div class="prow">
+      <img class="qr" id="qr${i}" alt="Player ${i} QR">
+      <div class="meta">
+        <div class="pname">PLAYER ${i}
+          <span class="tchip"><span class="dot ${team}"></span>${team.toUpperCase()} TEAM</span>
+        </div>
+        <div class="url"><span id="url${i}"></span>
+          <button onclick="copyUrl('${slot}', this)">copy</button></div>
+        <div class="state" id="st${i}">…</div>
+        <div class="buttons" id="b${i}"></div>
+        <div class="dpad">dpad <b id="d${i}">·</b></div>
+      </div>
+    </div>`;
+  document.getElementById(team === "red" ? "cardsRed" : "cardsBlue").appendChild(div);
 }
 
-function playerCard(slot, p) {
+function copyUrl(slot, btn){
+  const url = document.getElementById("url" + slotNum(slot)).textContent;
+  navigator.clipboard?.writeText(url).then(() => {
+    btn.textContent = "copied"; setTimeout(() => btn.textContent = "copy", 1200);
+  });
+}
+
+function playerCard(slot, p){
   const i = slotNum(slot);
   document.getElementById("st" + i).innerHTML =
-    p.connected ? `<span class="ok">● connected</span> ${p.ready ? '<span class="ok">· READY</span>' : '· not ready'}`
-                : '<span class="bad">○ not connected</span>';
+    p.connected ? `<span class="ok">● connected</span> <span class="dim">${p.ready ? "· ready" : "· not ready"}</span>`
+                : '<span class="bad">○ not connected</span> <span class="dim">— scan the QR</span>';
   document.getElementById("b" + i).innerHTML =
-    p.buttons.length ? p.buttons.map(b => `<span class="pill on">${b}</span>`).join("") : "";
-  document.getElementById("d" + i).textContent =
-    "D-pad " + arrows[(p.dpad.x) + "," + (p.dpad.y)];
+    p.buttons.length ? p.buttons.map(b => `<span class="pill">${b}</span>`).join("") : "";
+  document.getElementById("d" + i).textContent = arrows[(p.dpad.x) + "," + (p.dpad.y)];
 }
 
-async function tick() {
+let serverUp = false;
+async function tick(){
   try {
     const s = await (await fetch("/api/status")).json();
+    document.body.classList.add("loaded");
+    serverUp = true;
+    let n = 0;
     for (const slot of Object.keys(s.qr)) {
       ensureCard(slot);
       const i = slotNum(slot);
       document.getElementById("url" + i).textContent = s.url + "/" + slot;
       document.getElementById("qr" + i).src = s.qr[slot];
       playerCard(slot, s.players[slot]);
+      if (s.players[slot].connected) n++;
     }
+    document.getElementById("connCount").textContent = n + "/4 phones";
+    document.getElementById("srvDot").className = "dot on";
     const f = document.getElementById("files");
     f.innerHTML = s.game_files.length
-      ? s.game_files.map(x => `${x.name} <span style="color:#4cd47c">(${(x.bytes / 1e9).toFixed(2)} GB)</span>`).join("<br>")
-      : '<span style="color:#ff6a5e">No game files detected yet.</span>';
-    document.getElementById("gameState").innerHTML = s.game_running
-      ? '<span class="ok">● game running</span>' : '○ game not running';
+      ? s.game_files.map(x => `${x.name} <span class="ok">(${(x.bytes / 1e9).toFixed(2)} GB)</span>`).join("<br>")
+      : '<span style="color:var(--bad)">No game files detected yet.</span>';
+    document.getElementById("gameState").textContent = s.game_running ? "game running" : "game stopped";
+    document.getElementById("gameDot").className = "dot game" + (s.game_running ? " running" : "");
     if (s.game_exe && !document.getElementById("exe").value)
       document.getElementById("exe").value = s.game_exe;
-  } catch (e) { /* server briefly unavailable; keep last state */ }
+  } catch (e) {
+    serverUp = false;
+    document.getElementById("srvDot").className = "dot";
+    document.getElementById("connCount").textContent = "server offline";
+  }
 }
 
-async function startGame() {
-  const r = await (await fetch("/api/game/start", { method: "POST" })).json();
-  if (r.error) alert(r.error);
-  tick();
-}
-async function stopGame() {
-  await fetch("/api/game/stop", { method: "POST" });
-  tick();
+function showError(msg){
+  const el = document.getElementById("gameError");
+  el.textContent = msg; el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 5000);
 }
 
-tick();
-setInterval(tick, 1000);
+async function startGame(btn){
+  btn.disabled = true;
+  try {
+    const r = await (await fetch("/api/game/start", { method: "POST" })).json();
+    if (r.error) showError(r.error);
+  } catch (e) { showError("Could not reach the server."); }
+  btn.disabled = false;
+  tick();
+}
+async function stopGame(btn){
+  btn.disabled = true;
+  try { await fetch("/api/game/stop", { method: "POST" }); }
+  catch (e) { showError("Could not reach the server."); }
+  btn.disabled = false;
+  tick();
+}
+tick(); setInterval(tick, 1000);
 </script>
 </body>
 </html>

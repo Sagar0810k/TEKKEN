@@ -249,3 +249,19 @@ mid-play re-locks the gate and releases all held outputs (code path
 checkGate -> releaseAllLocal on ungated->gated transition). To verify on a
 real phone: hold a button, rotate to portrait, gate must appear and the game
 must see the button released; rotate back to resume.
+
+## 2026-11-12 — Stage C1 live experiment (4 virtual pads, one process)
+- Offline OFFLINE MODE > PAIR PLAY (console 4-player mode): **all four virtual pads joined the stones** in player order (START each, LEFT/RIGHT to a stone, A to confirm; the "Exiting player select. Continue anyway?" dialog's OK = advance). Red = P1+P2, blue = P3+P4 confirmed on screen (pair_play_four_seated.png).
+- Pair Play character select: **one picker cursor per side** (P2 drove red, P3 drove blue; P1/P4 had no cursor). 2 fighters per side confirmed; match start reached in earlier runs.
+- TEAM BATTLE: LEFT/RIGHT sets team size 1..8 characters per side ("2 PLAYERS ON TEAM"); extra local pads' START ignored -> one human per side, other side CPU.
+- Online room (PAIR PLAY > QUICK MATCH > BEGIN SEARCH, Steam-less loopback fallback): **P2 joined the host's red side locally** with own cursor and picked their own fighter (Nina); the blue side is hard-wired to a remote PC ("each on their own PC" - the game's own help text). P3/P4 START presses ignored in the room. True per-fighter 4-human 2v2 needs the second loopback instance (fallback plan).
+- Game window was closed externally once and exited once without the clean-quit log line; relaunches were clean. Server restarted fresh before the session (4 pads ready).
+- Deliverable: README.md (root) rewritten with full setup + 2v2 guide; screenshots in images/.
+
+## 2026-11-12 — Server startup UX + operator dashboard redesign
+- Server banner added at startup (flush=True): prints the localhost dashboard URL, the four per-phone LAN URLs, and explains that 0.0.0.0 just means "all interfaces" (localhost works on the laptop). Verified in a redirected log.
+- start_server.bat now auto-opens http://localhost:8000/ on the laptop 3 s after launch.
+- Operator dashboard (console/static/operator.html) redesigned per the ai-design-skills system (landing-page-design + figma-designer): Manrope + Geist Mono vendored locally (console/static/fonts, OFL, offline-safe), flat #181818-family surfaces only, Tailwind type scale, radius 16/8, heading gradient white->#9B9B9B as the only gradient, team identity via labeled chips (no border-top stripes), full button states (hover/active scale(0.98)/focus ring/disabled), inline error instead of alert(), skeleton loading state, inline SVG icons, motion cubic-bezier(0.22,1,0.36,1) with prefers-reduced-motion respected.
+- Verified: server boots, / and /static/fonts/f12.woff2 and /api/status all return 200; API contract unchanged (/api/status, /api/game/start|stop).
+- The ai-design-skills repo clone (temp dir) was deleted after use; only the vendored fonts remain in the repo.
+- Server left STOPPED after testing; game window parked at main menu.

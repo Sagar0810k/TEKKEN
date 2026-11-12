@@ -444,6 +444,18 @@ async def watchdog():
 async def on_startup():
     asyncio.create_task(watchdog())
     init_bridge()
+    ip = lan_ip()
+    line = "=" * 62
+    print(line, flush=True)
+    print(" TTT2 LOCAL CONSOLE SERVER", flush=True)
+    print(f"   this laptop (dashboard):  http://localhost:{PORT}/", flush=True)
+    print(f"   PHONES (same Wi-Fi):      http://{ip}:{PORT}/player1", flush=True)
+    print(f"                             http://{ip}:{PORT}/player2", flush=True)
+    print(f"                             http://{ip}:{PORT}/player3", flush=True)
+    print(f"                             http://{ip}:{PORT}/player4", flush=True)
+    print(" '0.0.0.0' only means 'listening on all network interfaces' -", flush=True)
+    print(" localhost works on this laptop; phones use the address above.", flush=True)
+    print(line, flush=True)
 
 
 if __name__ == "__main__":
