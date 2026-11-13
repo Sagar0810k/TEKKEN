@@ -21,8 +21,10 @@ from pathlib import Path
 import qrcode
 import uvicorn
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+
+import ttt2_license
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -270,6 +272,8 @@ async def operator():
 @app.get("/player3", response_class=HTMLResponse)
 @app.get("/player4", response_class=HTMLResponse)
 async def player_page():
+    if not ttt2_license.is_licensed():
+        return RedirectResponse("/", status_code=302)
     return (STATIC / "controller.html").read_text(encoding="utf-8")
 
 
@@ -298,7 +302,10 @@ async def config_save(slot: str, body: dict):
 async def status():
     ip = lan_ip()
     base = f"http://{ip}:{PORT}"
+    lic = ttt2_license.state()
     return {
+        "licensed": lic["licensed"],
+        "license": {k: lic[k] for k in ("fingerprint", "key_masked", "activated_at", "error")},
         "ip": ip,
         "port": PORT,
         "url": base,
@@ -310,9 +317,22 @@ async def status():
     }
 
 
+@app.post("/api/license/activate")
+async def license_activate(body: dict):
+    result = ttt2_license.activate(body.get("key", ""))
+    if result.get("ok"):
+        init_bridge()  # pads come up immediately, no restart needed
+        return {"ok": True, "key_masked": result["key_masked"],
+                "activated_at": result["activated_at"]}
+    return JSONResponse({"error": result.get("error", "activation failed")}, status_code=400)
+
+
 @app.post("/api/game/start")
 async def game_start():
     """Launch the configured game executable (path set locally in settings.json)."""
+    if not ttt2_license.is_licensed():
+        return JSONResponse({"error": "license required - activate at http://localhost:%d/" % PORT},
+                            status_code=403)
     global game_process
     exe = game_exe()
     if not exe or not Path(exe).exists():
@@ -325,6 +345,8 @@ async def game_start():
 
 @app.post("/api/game/stop")
 async def game_stop():
+    if not ttt2_license.is_licensed():
+        return JSONResponse({"error": "license required"}, status_code=403)
     global game_process
     if game_process is not None and game_process.poll() is None:
         game_process.terminate()
@@ -443,19 +465,30 @@ async def watchdog():
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(watchdog())
-    init_bridge()
-    ip = lan_ip()
-    line = "=" * 62
-    print(line, flush=True)
-    print(" TTT2 LOCAL CONSOLE SERVER", flush=True)
-    print(f"   this laptop (dashboard):  http://localhost:{PORT}/", flush=True)
-    print(f"   PHONES (same Wi-Fi):      http://{ip}:{PORT}/player1", flush=True)
-    print(f"                             http://{ip}:{PORT}/player2", flush=True)
-    print(f"                             http://{ip}:{PORT}/player3", flush=True)
-    print(f"                             http://{ip}:{PORT}/player4", flush=True)
-    print(" '0.0.0.0' only means 'listening on all network interfaces' -", flush=True)
-    print(" localhost works on this laptop; phones use the address above.", flush=True)
-    print(line, flush=True)
+    if ttt2_license.is_licensed():
+        init_bridge()
+        ip = lan_ip()
+        line = "=" * 62
+        print(line, flush=True)
+        print(" TTT2 LOCAL CONSOLE SERVER", flush=True)
+        print(f"   this laptop (dashboard):  http://localhost:{PORT}/", flush=True)
+        print(f"   PHONES (same Wi-Fi):      http://{ip}:{PORT}/player1", flush=True)
+        print(f"                             http://{ip}:{PORT}/player2", flush=True)
+        print(f"                             http://{ip}:{PORT}/player3", flush=True)
+        print(f"                             http://{ip}:{PORT}/player4", flush=True)
+        print(" '0.0.0.0' only means 'listening on all network interfaces' -", flush=True)
+        print(" localhost works on this laptop; phones use the address above.", flush=True)
+        print(line, flush=True)
+    else:
+        st = ttt2_license.state()
+        line = "=" * 62
+        print(line, flush=True)
+        print(" TTT2 LOCAL CONSOLE - LICENSE REQUIRED", flush=True)
+        print(f"   this laptop fingerprint:  {st['fingerprint']}", flush=True)
+        print("   The controller pads and game control are LOCKED until", flush=True)
+        print("   a valid license key is entered on the dashboard.", flush=True)
+        print(f"   Open:  http://localhost:{PORT}/  and enter your key.", flush=True)
+        print(line, flush=True)
 
 
 if __name__ == "__main__":

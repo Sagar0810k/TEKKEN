@@ -145,6 +145,30 @@
           color: var(--text-2); padding: 4px 0; }
   .file .ok { font-weight: 700; }
 
+  /* ---- Activation gate (shown until a valid license is entered) ---- */
+  .gate { position: fixed; inset: 0; z-index: 50; background: var(--bg);
+          display: none; align-items: center; justify-content: center; padding: 24px; }
+  .gate.show { display: flex; }
+  .gatecard { width: 100%; max-width: 440px; background: var(--surface);
+              border-radius: 16px; padding: 32px; }
+  .gatecard .icon { display: flex; justify-content: center; margin-bottom: 16px;
+                    color: var(--text-2); }
+  .gatecard h2 { font-size: 24px; font-weight: 800; letter-spacing: -0.02em;
+                 margin: 0 0 4px; text-align: center;
+                 background: linear-gradient(90deg, #FFFFFF, #9B9B9B);
+                 -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .gatecard .sub { font-size: 14px; color: var(--text-2); text-align: center;
+                   margin: 0 0 20px; line-height: 1.6; }
+  .gatecard .fp { font-family: "Geist Mono", monospace; font-size: 12px;
+                  color: var(--text-2); background: var(--surface-2);
+                  border-radius: 8px; padding: 10px 12px; margin-bottom: 16px;
+                  display: flex; justify-content: space-between; gap: 12px; }
+  .gatecard .fp b { color: var(--text); font-weight: 700; }
+  .gatecard label { display: block; font-size: 12px; font-weight: 700;
+                    color: var(--text-2); margin-bottom: 6px; letter-spacing: 0.04em; }
+  .gatecard input { margin-bottom: 12px; min-width: 0; width: 100%; }
+  .gatecard button { width: 100%; }
+
   /* ---- Skeleton loading ---- */
   .skeleton { background: var(--surface-2); border-radius: 8px;
               animation: shimmer 1.6s ease-in-out infinite; }
@@ -166,6 +190,23 @@
 </style>
 </head>
 <body>
+<div class="gate" id="gate">
+  <div class="gatecard">
+    <div class="icon">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+    </div>
+    <h2>Activate your license</h2>
+    <p class="sub">This copy of TTT2 Local Lounge is locked until a valid
+      license key is entered. Each key activates <b>one laptop</b>, for life.
+      Send this laptop's fingerprint to your seller to receive your key.</p>
+    <div class="fp"><span>This laptop fingerprint</span><b id="fp">…</b></div>
+    <label for="lickey">LICENSE KEY</label>
+    <input id="lickey" placeholder="TTT2-XXXXXXXX-XXXXXXXX" autocomplete="off" spellcheck="false">
+    <div class="error" id="licError"></div>
+    <button class="primary big" onclick="activateLicense(this)">Activate</button>
+  </div>
+</div>
+
 <div class="head">
   <div class="brand">
     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h4M8 10v4"/><path d="M15 11h.01M18 13h.01"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.051-.011-.1-.017-.151A4 4 0 0 0 17.32 5z"/></svg>
@@ -277,6 +318,12 @@ async function tick(){
     const s = await (await fetch("/api/status")).json();
     document.body.classList.add("loaded");
     serverUp = true;
+    if (!s.licensed) {
+      document.getElementById("fp").textContent = s.license.fingerprint || "";
+      document.getElementById("gate").classList.add("show");
+      return; // locked: the rest of the dashboard stays hidden
+    }
+    document.getElementById("gate").classList.remove("show");
     let n = 0;
     for (const slot of Object.keys(s.qr)) {
       ensureCard(slot);
@@ -307,6 +354,28 @@ function showError(msg){
   const el = document.getElementById("gameError");
   el.textContent = msg; el.classList.add("show");
   setTimeout(() => el.classList.remove("show"), 5000);
+}
+
+async function activateLicense(btn){
+  const input = document.getElementById("lickey");
+  const err = document.getElementById("licError");
+  err.classList.remove("show");
+  const key = input.value.trim();
+  if (!key) { err.textContent = "Enter your license key first."; err.classList.add("show"); return; }
+  btn.disabled = true;
+  try {
+    const r = await (await fetch("/api/license/activate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key })
+    })).json();
+    if (r.ok) { location.reload(); return; }
+    err.textContent = r.error || "Activation failed.";
+    err.classList.add("show");
+  } catch (e) {
+    err.textContent = "Could not reach the server.";
+    err.classList.add("show");
+  }
+  btn.disabled = false;
 }
 
 async function startGame(btn){

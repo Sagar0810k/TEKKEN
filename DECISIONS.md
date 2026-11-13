@@ -271,3 +271,24 @@ failed attempt; the landscape requirement is never bypassable.
 - Verified: server boots, / and /static/fonts/f12.woff2 and /api/status all return 200; API contract unchanged (/api/status, /api/game/start|stop).
 - The ai-design-skills repo clone (temp dir) was deleted after use; only the vendored fonts remain in the repo.
 - Server left STOPPED after testing; game window parked at main menu.
+
+## 2026-11-13 — License system added (sellable product)
+- Model decided: lifetime, single-seat — one key activates ONE laptop, then works forever. Without a valid license EVERYTHING is locked: no virtual pads (init_bridge skipped), phones redirected 302 to /, /api/game/start|stop return 403, dashboard shows only the activation gate.
+- console/ttt2_license.py: machine fingerprint (hostname+MachineGuid SHA256, shown as FP-XXXX-XXXX-XXXX-XXXX), key format TTT2-SERIAL-SIG where SIG = HMAC-SHA256(SERIAL, embedded secret) truncated 8 hex. Activation writes hidden license.json (key, fingerprint, timestamp, HMAC record-mac) - tamper-tested: edited key -> "license key in file is invalid", swapped fingerprint -> "license record was modified".
+- console/keygen.py: SELLER-ONLY tool. `python keygen.py 3 "buyer name"` mints keys, validates them, appends to licenses_issued.csv (issued_at, buyer, key). Buyers never get keygen.py or licenses_issued.csv.
+- server.py: startup banner splits licensed (pads ready + full URL banner) vs locked (LICENSE REQUIRED banner with fingerprint); /api/status carries licensed + license fields; POST /api/license/activate validates + binds + init_bridge() immediately (no restart); operator.html shows a full-screen activation gate when licensed=false (design-system styled, inline errors).
+- Verified live: locked boot banner, /api/status licensed:false, /player1 302, /api/game/start 403 with message, activation gate renders (tools/gate_ui.png), keygen output + CSV, invalid-key rejection, tamper detection both ways.
+- Caveat recorded (offline model): enforcement = one key binds one laptop; a key-holder could still activate the same raw key on a second PC since there is no online activation server. Acceptable for small-scale direct sales; online activation is the future hardening step.
+- 3 test keys generated for owner/stock (TTT2-73AE9862-C3D4E199, TTT2-90BE4972-DA569412, TTT2-B9775DBA-247AF9FB) - none consumed on the owner's laptop yet; machine currently UNLICENSED.
+
+## 2026-11-13 — License system added (sellable product) [append pending from earlier]
+- Model: lifetime, single-seat, everything locked without a license. Keys are FINGERPRINT-BOUND: buyer sends the fingerprint shown on their activation screen; seller mints with keygen.py (key = TTT2-SERIAL-SIG, SIG = HMAC-SHA256(serial|fingerprint)). Verified: key minted for laptop A validates on A, INVALID on B, even with the raw key text shared. Activation writes a hidden, HMAC-tamper-checked license.json bound to the machine (tested: edited key -> invalid, swapped fingerprint -> record modified).
+- Locked mode verified live: no pads, phones 302 to /, game start 403, dashboard shows only the activation gate (tools/gate_ui.png).
+
+## 2026-11-13 — Buyer package: self-extracting, self-deleting installer
+- console/build_package.py (SELLER-ONLY) builds dist/TTT2_Local_Lounge_SETUP.bat: a single ~106 KB file with the lounge system embedded as base64. No key, no keygen.py, no licenses_issued.csv, no README/docs, no seller settings.json (fresh empty one included).
+- Flow: buyer double-clicks -> extracts TTT2_Local_Lounge/ next to itself -> prints instructions -> DELETES ITSELF. Verified in a buyer simulation: folder extracted (server, ttt2_license.py, start_server.bat, INSTALL.bat, requirements.txt, static + 2 fonts, settings.json template, START_HERE.txt, package_id.txt), installer file gone after run.
+- Bugs fixed during testing: (1) the payload marker also appeared inside the extraction command - IndexOf grabbed the wrong text; fixed by splitting the string in the command. (2) %RANDOM% + Expand-Archive path concat broke - replaced with pre-composed env vars + .NET ZipFile::ExtractToDirectory. (3) zip nested a second TTT2_Local_Lounge folder - flattened.
+- Buyer boot test (extracted copy, port 8123): starts LOCKED, correct fingerprint, /api/status licensed:false. The system refuses to work on any laptop until the seller mints a fingerprint-bound key.
+- Honest limitation recorded: no file can literally self-corrupt when copied; the installer self-deletes after first extraction and the software is fingerprint-locked, which is the enforceable equivalent - a forwarded package or extracted folder is a locked brick without a key for THAT laptop.
+- Dashboard button/share route requested then cancelled by user - server.py reverted to clean state (no seller/package endpoints; py_compile OK).

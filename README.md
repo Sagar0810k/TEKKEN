@@ -189,6 +189,36 @@ For couch play, **offline PAIR PLAY above is the recommended mode today.**
 
 ---
 
+## 🔑 For the seller — licensing & selling copies
+
+You (the seller) have three extra tools in `console/` that buyers never get:
+`keygen.py`, `build_package.py`, `licenses_issued.csv`.
+
+**How a sale works:**
+1. Build the buyer installer once per share: `python build_package.py`
+   → creates `dist\TTT2_Local_Lounge_SETUP.bat`.
+   It contains the system **only** — no key, no keygen, no docs — and it
+   **extracts once, then deletes itself**.
+2. Send `TTT2_Local_Lounge_SETUP.bat` to the buyer (WhatsApp/email/USB).
+   Browsers may warn about .bat files — the buyer clicks *Keep*.
+3. The buyer double-clicks it, follows `START_HERE.txt`, and on first run
+   the dashboard is **LOCKED**: it shows their **laptop fingerprint**
+   (e.g. `9F3E-E2FB-EA8F-6C53`). They send it to you.
+4. Mint their key: `python keygen.py 1 "buyer name" <their fingerprint>`
+   → one lifetime key, mathematically bound to that laptop.
+5. Buyer types the key on the dashboard → activated forever on their machine.
+
+**Why a shared copy is useless:** every key is HMAC-bound to one specific
+laptop fingerprint — a key minted for laptop A fails on laptop B, and the
+activation record is tamper-checked. The installer contains no key, so a
+forwarded package is just a locked brick until YOU issue a key for that
+laptop. (`package_id.txt` inside records the build time for your reference.)
+
+**Keep private (never ship):** `keygen.py`, `licenses_issued.csv`,
+`license.json`, `demo_keygen.bat`, `build_package.py`, and the project docs.
+
+---
+
 ## 📚 Project docs
 
 | File | Contents |
