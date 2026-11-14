@@ -292,3 +292,29 @@ failed attempt; the landscape requirement is never bypassable.
 - Buyer boot test (extracted copy, port 8123): starts LOCKED, correct fingerprint, /api/status licensed:false. The system refuses to work on any laptop until the seller mints a fingerprint-bound key.
 - Honest limitation recorded: no file can literally self-corrupt when copied; the installer self-deletes after first extraction and the software is fingerprint-locked, which is the enforceable equivalent - a forwarded package or extracted folder is a locked brick without a key for THAT laptop.
 - Dashboard button/share route requested then cancelled by user - server.py reverted to clean state (no seller/package endpoints; py_compile OK).
+
+## 2026-11-13 — Automatic environment setup (requirements.txt + INSTALL.bat upgrade)
+- requirements.txt now covers every pip dependency the server actually imports: fastapi, uvicorn[standard] (websockets for the phone links were previously missing), qrcode[pillow], and vgamepad (the ViGEm client - previously assumed present).
+- console/INSTALL.bat upgraded to a 5-step automatic setup: (1) detects Python, opens the download page and instructs "Add to PATH" if missing; (2) pip installs requirements; (3) detects the ViGEm Bus driver via sc query, downloads ViGEmBusSetup_x64.exe v1.22.0 from GitHub releases, self-elevates and installs silently; (4) detects an empty settings.json game_exe and prompts drag-and-drop of the game exe, validating the path and writing settings.json via python; (5) verifies all imports + driver, prints SETUP COMPLETE.
+- Tested live on the seller machine: all 5 steps pass (Python 3.12.6, libs, driver already installed -> skipped, settings already set -> skipped, verification OK).
+- START_HERE.txt simplified to match: Python -> INSTALL.bat (does everything) -> start_server.bat -> activate.
+- Buyer package rebuilt (107,175 bytes) and Desktop copy refreshed. Buyer re-extract verified: INSTALL.bat + new requirements included, installer self-deletes.
+- The buyer's total setup is now: install Python -> run INSTALL.bat -> run start_server.bat -> send fingerprint -> enter key.
+
+## 2026-11-13 — Buyer guide PDF added to the package
+- guide.html (C:\TEKKEN\) renders the complete illustrated guide with a print-friendly light theme (Manrope/Geist Mono vendored): cover, requirements table, Part A install (installer self-extract explained, Python with Add-to-PATH, INSTALL.bat's 5 steps detailed, license activation), Part B phones (links table, QRs, layout editor, first-press golden rule, controller table), Part C the 4-player 2v2 PAIR PLAY choreography per player with screenshots (stones dialog quirk, one picker per side, tag fight), Part D other modes (VS 1v1, TEAM BATTLE 1-8, single-player), Part E troubleshooting, Part F seller appendix (build_package, keygen, fingerprint-bound keys).
+- Rendered to dist/TTT2_Local_Lounge_Guide.pdf via headless Edge --print-to-pdf (11.7 MB, screenshots embedded).
+- build_package.py now embeds the PDF at the package root as TTT2_Guide.pdf (when present) and START_HERE.txt points buyers to it.
+- Rebuilt SETUP.bat is 15.5 MB (PDF included); Desktop copy refreshed. Buyer re-extract verified: guide PDF at root, installer still self-deletes.
+
+## 2026-11-13 — Guide PDF: seller appendix removed
+- Part F (For the seller - keys & packages) removed from guide.html; PDF re-rendered (11.2 MB) and the buyer SETUP.bat rebuilt (15.5 MB) + Desktop copy refreshed.
+- Verified in a fresh buyer extraction: no build_package.py, no keygen.py, no licenses_issued.csv, no license.json, no demo_keygen.bat anywhere in the extracted tree (they were already excluded by the FILES whitelist; the PDF no longer mentions them either). Guide PDF present at package root. Installer self-deletes.
+- The buyer guide now ends after Troubleshooting with the closing line - it contains nothing about how packages or keys are made.
+
+## 2026-11-13 — Final Drive-distribution build verified
+- START_HERE.txt numbering fixed (was 1,2,3,3,4,5 -> now 1..6) and wording confirms the Drive flow: extract the ISO zip and TU3 zip, then give ttt2_setup.exe the extracted locations.
+- Final SETUP.bat rebuilt (107,187 bytes, NO PDF inside) and Desktop copy refreshed.
+- Fresh buyer sim (buyer_sim6): extracts cleanly, START_HERE steps correct, installer self-deletes, tree contains no seller tools (build_package.py/keygen.py/licenses_issued.csv/license.json) and no PDF.
+- dist/Game Install.pdf (11.3 MB) is the buyer guide to upload to Drive; it has no seller appendix and teaches the ISO/TU3 zip extraction + ttt2_setup.exe location flow. Old TTT2_Local_Lounge_Guide.pdf superseded.
+- Seller Drive upload list: SETUP.bat, Game Install.pdf, ISO as zip, TU3 as zip, ttt2_setup.exe (port's GitHub releases).

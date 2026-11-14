@@ -49,41 +49,30 @@ FILES = [
 START_HERE = """TTT2 LOCAL LOUNGE - QUICK SETUP
 ==============================
 
-You need: one Windows gaming laptop, one TV (HDMI), up to 4 smartphones,
-and your own legal copy of Tekken Tag Tournament 2 for PC.
+Your seller sent you (usually as a Google Drive folder):
+  1. TTT2_Local_Lounge_SETUP.bat   - this system (you already ran it)
+  2. Game Install.pdf              - the full illustrated step-by-step guide
+  3. The Tekken disc image (.iso) and TU3 - as ZIP files: extract both
+     before using them
+  4. ttt2_setup.exe                - builds the PC game from the ISO + TU3
 
-ONE-TIME SETUP
---------------
-1. Install Python:  https://www.python.org/downloads/
-   IMPORTANT: tick "Add python.exe to PATH" in the installer.
-2. Double-click console\\INSTALL.bat  (installs the libraries once).
-3. Install the virtual controller driver (one time):
-   https://github.com/ViGEm/ViGEmBus/releases - download and run
-   ViGEmBusSetup_x64.exe.
-4. Tell the software where your game is:
-   open console\\settings.json in Notepad and put the FULL path to your
-   Tekken Tag Tournament 2 .exe between the quotes, e.g.
-   { "game_exe": "D:\\Games\\TTT2\\TekkenTagTournament2.exe" }
+Follow "Game Install.pdf" step by step. The short version:
 
-FIRST RUN - ACTIVATE
---------------------
-5. Double-click console\\start_server.bat
-6. The dashboard opens and asks for a LICENSE KEY, and shows a
-   "laptop fingerprint" like 9F3E-E2FB-EA8F-6C53.
-7. Send that fingerprint to your seller. They will send you one key
-   (looks like TTT2-XXXXXXXX-XXXXXXXX).
-8. Type the key on the dashboard and press Activate. That key works on
-   THIS laptop only, forever - you never need it again.
+  1. Install Python (python.org - tick "Add python.exe to PATH")
+  2. Extract the ISO zip and TU3 zip (right-click -> Extract All)
+  3. Run ttt2_setup.exe -> give it the extracted ISO and TU3 locations
+     -> it builds the game
+  4. Double-click console\\INSTALL.bat (installs libraries + the virtual
+     controller driver, and asks you to DRAG the game .exe in)
+  5. Double-click console\\start_server.bat
+     -> send the laptop fingerprint shown on the dashboard to your seller
+     -> type the key they send back -> Activate. Forever on this laptop.
+  6. Phones on the same Wi-Fi: open the player links or scan the QRs on
+     the dashboard. Press "Start game", then OFFLINE MODE -> PAIR PLAY
+     is the 4-player 2v2 mode.
 
-PLAY (every session)
---------------------
-9. start_server.bat  ->  dashboard opens automatically.
-10. On each phone (same Wi-Fi), open the player link shown on the
-    dashboard cards (or scan its QR code) - rotate to landscape.
-11. Press "Start game" on the dashboard, then follow the on-screen guide:
-    OFFLINE MODE -> PAIR PLAY is the 4-player 2v2 mode.
-
-If anything fails, re-read step 2 and 3 - they fix 90% of problems.
+If anything fails, run console\\INSTALL.bat again - it fixes
+libraries, driver and game path in one go.
 """
 
 SETUP_TEMPLATE = """@echo off

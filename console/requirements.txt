@@ -1,3 +1,12 @@
+# TTT2 Local Lounge - all Python libraries the system needs
+# (installed automatically by INSTALL.bat)
+
+# dashboard + phone controller HTTP/WebSocket server
 fastapi
-uvicorn
+uvicorn[standard]
+
+# QR codes shown on the dashboard
 qrcode[pillow]
+
+# the four virtual Xbox 360 controllers the game sees
+vgamepad

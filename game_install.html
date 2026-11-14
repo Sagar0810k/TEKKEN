@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Game Install — TTT2 Local Lounge Buyer Guide</title>
+<style>
+  @font-face { font-family: "Manrope"; src: url("console/static/fonts/f12.woff2") format("woff2"); font-weight: 400 800; }
+  @font-face { font-family: "Geist Mono"; src: url("console/static/fonts/f6.woff2") format("woff2"); font-weight: 400 700; }
+  @page { size: A4; margin: 16mm 15mm 18mm; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: "Manrope", "Segoe UI", sans-serif; color: #1a1a1a; font-size: 10.5pt; line-height: 1.55; margin: 0; }
+  h1, h2, h3 { line-height: 1.2; }
+  .cover { page-break-after: always; text-align: center; padding-top: 55mm; }
+  .cover h1 { font-size: 32pt; font-weight: 800; margin: 0 0 8pt; }
+  .cover .tag { font-size: 14pt; color: #555; margin-bottom: 28pt; }
+  .cover .badge { display: inline-block; background: #181818; color: #fff; border-radius: 999px; padding: 6pt 16pt; font-size: 10pt; font-weight: 700; margin: 3pt; }
+  .cover .note { margin-top: 24mm; color: #777; font-size: 9.5pt; }
+  h2 { font-size: 16.5pt; font-weight: 800; border-bottom: 3pt solid #181818; padding-bottom: 5pt; margin: 26pt 0 12pt; page-break-after: avoid; }
+  h3 { font-size: 12.5pt; font-weight: 800; margin: 16pt 0 7pt; page-break-after: avoid; }
+  h2 .num { display: inline-block; background: #181818; color: #fff; border-radius: 7pt; padding: 1pt 9pt; margin-right: 7pt; }
+  .step { display: flex; margin: 10pt 0; page-break-inside: avoid; }
+  .step .n { flex: none; width: 22pt; height: 22pt; background: #FF4D5A; color: #fff; border-radius: 50%; text-align: center; font-weight: 800; font-size: 11pt; line-height: 22pt; margin-right: 9pt; margin-top: 1pt; }
+  .step.blue .n { background: #4DA3FF; }
+  .step .b { flex: 1; }
+  .step .b b.t { display: block; font-size: 11pt; margin-bottom: 2pt; }
+  code, .mono { font-family: "Geist Mono", monospace; font-size: 9pt; background: #f1f1f1; border-radius: 3pt; padding: 1pt 4pt; }
+  .path { font-family: "Geist Mono", monospace; font-size: 8.5pt; }
+  .tip { background: #FFF7E6; border-radius: 8pt; padding: 8pt 12pt; margin: 9pt 0; page-break-inside: avoid; }
+  .warn { background: #FDECEA; border-radius: 8pt; padding: 8pt 12pt; margin: 9pt 0; page-break-inside: avoid; }
+  .ok { background: #EAF7EE; border-radius: 8pt; padding: 8pt 12pt; margin: 9pt 0; page-break-inside: avoid; }
+  table { width: 100%; border-collapse: collapse; margin: 9pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  th { background: #181818; color: #fff; text-align: left; padding: 5pt 8pt; font-weight: 700; }
+  td { border-bottom: 1pt solid #ddd; padding: 5pt 8pt; vertical-align: top; }
+  tr { page-break-inside: avoid; }
+  img { max-width: 88%; border: 1pt solid #ccc; border-radius: 6pt; margin: 6pt auto; display: block; page-break-inside: avoid; }
+  .caption { text-align: center; color: #777; font-size: 8.5pt; margin: 2pt 0 10pt; }
+  .pb { page-break-before: always; }
+  .red { color: #c22335; font-weight: 700; }
+  .blue { color: #1a6fd4; font-weight: 700; }
+  .kbd { font-family: "Geist Mono", monospace; font-size: 8.5pt; background: #181818; color: #fff; border-radius: 3pt; padding: 1.5pt 6pt; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>Game Install</h1>
+  <div class="tag">TTT2 Local Lounge — Buyer's Step-by-Step Guide</div>
+  <div>
+    <span class="badge">4 phones = 4 controllers</span>
+    <span class="badge">1 laptop</span>
+    <span class="badge">TV via HDMI</span>
+  </div>
+  <div>
+    <span class="badge">Wi-Fi only when playing</span>
+    <span class="badge">Real 2v2 tag team</span>
+  </div>
+  <div class="note">Follow every step in order. Total one-time setup: about 30 minutes.</div>
+</div>
+
+<h2>What your seller sent you</h2>
+<p>You received a Google Drive folder containing <b>5 files</b>. Download <b>all of them</b> into one folder on your laptop (for example <span class="path">Downloads\TTT2\</span>):</p>
+<table>
+  <tr><th>#</th><th>File</th><th>What it is</th></tr>
+  <tr><td>1</td><td><span class="path">TTT2_Local_Lounge_SETUP.bat</span></td><td>The controller system — installs in Step 2 of this guide</td></tr>
+  <tr><td>2</td><td><span class="path">Game Install.pdf</span></td><td>This guide</td></tr>
+  <tr><td>3</td><td><span class="path">TTT2 game ISO (zip)</span></td><td>The game disc image, zipped — extract it in Step 3</td></tr>
+  <tr><td>4</td><td><span class="path">TU3 (zip)</span></td><td>The game's official Title Update 3, zipped — extract it in Step 3</td></tr>
+  <tr><td>5</td><td><span class="path">ttt2_setup.exe</span></td><td>The game builder — turns the ISO + TU3 into a playable PC game</td></tr>
+</table>
+<div class="tip"><b>Download link from your seller:</b> <span class="mono">https://drive.google.com/drive/folders/1IguQQwEF0J9hfeS1gE_7qf27s999GKbj</span> — if your seller shares a different link, use theirs.</div>
+<div class="warn"><b>Check before starting:</b> Windows 10/11 64-bit · about <b>13 GB free disk space</b> · any DirectX 11 graphics card (the game uses your laptop's dedicated GPU automatically).</div>
+
+<div class="pb"></div>
+<h2><span class="num">1</span>Run the lounge installer</h2>
+<div class="step"><div class="n">1</div><div class="b">
+  <b class="t">Double-click <span class="path">TTT2_Local_Lounge_SETUP.bat</span></b>
+  <ul>
+    <li>The browser / Windows may warn about <code>.bat</code> files — this is normal. Choose <b>Keep</b> / <b>More info → Run anyway</b>.</li>
+  </ul>
+</div></div>
+<div class="step"><div class="n">2</div><div class="b">
+  <b class="t">Watch it extract</b> — it creates a <b>TTT2_Local_Lounge</b> folder next to itself with everything inside, then <b>deletes itself</b>. That is normal.
+</div></div>
+<div class="ok"><b>Result:</b> a folder like <span class="path">Downloads\TTT2_Local_Lounge\</span> containing <span class="path">console\</span> and <span class="path">START_HERE.txt</span>.</div>
+
+<h2><span class="num">2</span>Install Python (once)</h2>
+<div class="step"><div class="n">3</div><div class="b">
+  <b class="t">Go to <code>python.org/downloads</code>, download and run the installer.</b>
+  <ul>
+    <li><span class="red">CRITICAL:</span> on the first screen, tick <b>“Add python.exe to PATH”</b> — without it nothing works.</li>
+    <li>Click <b>Install Now</b>, wait for “Setup was successful”.</li>
+  </ul>
+</div></div>
+
+<h2><span class="num">3</span>Extract the game files, then build the game</h2>
+
+<h3>Step 3a — Extract the two zips (once)</h3>
+<div class="step"><div class="n">4</div><div class="b">
+  <b class="t">In your download folder, right-click the game ISO zip and choose <b>Extract All…</b> → <b>Extract</b>.</b>
+</div></div>
+<div class="step"><div class="n">5</div><div class="b">
+  <b class="t">Do the same for the TU3 zip.</b>
+</div></div>
+<div class="ok"><b>Remember the two extracted locations</b> — for example
+  <span class="path">Downloads\TTT2\TTT2_game_iso\</span> (contains the <span class="mono">.iso</span>)
+  and <span class="path">Downloads\TTT2\TU3\</span>. The builder will ask for them next.</div>
+<div class="tip">Google Drive sometimes <b>zips files when you download a whole folder</b> — if you downloaded one big zip, extract that first and you'll find the ISO zip and TU3 zip inside.</div>
+
+<h3>Step 3b — Build the game with ttt2_setup.exe</h3>
+<div class="step"><div class="n">6</div><div class="b">
+  <b class="t">Double-click <span class="path">ttt2_setup.exe</span></b>
+  <ul>
+    <li>Windows may say <b>“Windows protected your PC”</b> — the builder isn't code-signed. Click <b>More info → Run anyway</b>.</li>
+    <li>Windows asks for admin permission — click <b>Yes</b>.</li>
+  </ul>
+</div></div>
+<div class="step"><div class="n">7</div><div class="b">
+  <b class="t">Give it the two locations you extracted:</b>
+  <ul>
+    <li>When asked for the <b>disc image</b>: browse to the extracted ISO folder and select the <span class="mono">.iso</span> file (<i>Tekken Tag Tournament 2 (USA, Europe)</i>).</li>
+    <li>When asked for the <b>update</b>: browse to the extracted <b>TU3 folder</b> (or TU3 file) and select it.</li>
+    <li>Choose an install location with at least 13 GB free.</li>
+  </ul>
+</div></div>
+<div class="step"><div class="n">8</div><div class="b">
+  <b class="t">Wait for it to build</b> — it checks your files, builds the PC version and prepares the game's shaders. Usually a few minutes.
+</div></div>
+<div class="ok"><b>Result:</b> <i>Tekken Tag Tournament 2</i> appears in your Start menu / Desktop, and you know the folder of the game's <span class="path">.exe</span> — you'll need it in Step 4.</div>
+<div class="warn"><b>Legal note:</b> the art, sound, stages and movies are built on <b>your</b> PC from your disc image. Nothing copyrighted is included in the files your seller shares.</div>
+
+<div class="pb"></div>
+<h2><span class="num">4</span>Run the automatic setup</h2>
+<div class="step"><div class="n">7</div><div class="b">
+  <b class="t">Open <span class="path">TTT2_Local_Lounge\console\</span> and double-click <span class="path">INSTALL.bat</span></b> — it does everything in 5 steps:
+</div></div>
+<table>
+  <tr><th>Setup step</th><th>What happens / what you do</th></tr>
+  <tr><td>1/5 Python</td><td>Detects Python. If missing, it opens the download page — install with “Add to PATH”, then run INSTALL.bat again.</td></tr>
+  <tr><td>2/5 Libraries</td><td>Downloads the server libraries automatically (needs internet this one time).</td></tr>
+  <tr><td>3/5 Controller driver</td><td>Downloads and installs the <b>ViGEm Bus driver</b>. Windows asks for permission — click <b>Yes</b>.</td></tr>
+  <tr><td>4/5 Game path</td><td>It asks: <i>“DRAG your Tekken Tag Tournament 2 .exe into this window”</i> — drag the game's .exe (from Step 3's install folder) into the black window and press <b>Enter</b>. (No game yet? Type <b>S</b> and Enter — run INSTALL.bat again later.)</td></tr>
+  <tr><td>5/5 Verification</td><td>Checks everything and prints <b>SETUP COMPLETE!</b></td></tr>
+</table>
+<div class="tip"><b>If anything ever breaks later:</b> run <span class="path">INSTALL.bat</span> again — it repairs libraries, driver and game path in one go.</div>
+
+<h2><span class="num">5</span>Activate your license (once, forever)</h2>
+<div class="step"><div class="n">8</div><div class="b">
+  Double-click <span class="path">console\start_server.bat</span>. The dashboard opens in your browser showing a <b>lock screen</b>.
+</div></div>
+<div class="step"><div class="n">9</div><div class="b">
+  The lock screen shows a <b>“laptop fingerprint”</b> — a code like <span class="mono">9F3E-E2FB-EA8F-6C53</span>.
+  <b>Send that code to your seller</b> (a WhatsApp photo is fine).
+</div></div>
+<div class="step"><div class="n">10</div><div class="b">
+  Your seller sends back a key like <span class="mono">TTT2-XXXXXXXX-XXXXXXXX</span>.
+  Type it in the <b>LICENSE KEY</b> box and press <b>Activate</b>.
+</div></div>
+<div class="ok"><b>Unlocked!</b> The full dashboard appears. This key works on <b>this laptop only</b>, forever — you never need it again.</div>
+<div class="warn"><b>Keep the black server window open</b> while you play — closing it turns off the controllers.</div>
+
+<div class="pb"></div>
+<h2><span class="num">6</span>Connect the phones</h2>
+<div class="step blue"><div class="n">1</div><div class="b">
+  Every phone joins the <b>same Wi-Fi</b> as the laptop.
+</div></div>
+<div class="step blue"><div class="n">2</div><div class="b">
+  On each phone's browser open its player link (printed on the dashboard and in the server window):
+  <table>
+    <tr><th>Phone</th><th>Open</th><th>Plays</th></tr>
+    <tr><td>Phone 1</td><td><span class="mono">http://LAPTOP-IP:8000/player1</span></td><td class="red">RED team</td></tr>
+    <tr><td>Phone 2</td><td><span class="mono">http://LAPTOP-IP:8000/player2</span></td><td class="red">RED team</td></tr>
+    <tr><td>Phone 3</td><td><span class="mono">http://LAPTOP-IP:8000/player3</span></td><td class="blue">BLUE team</td></tr>
+    <tr><td>Phone 4</td><td><span class="mono">http://LAPTOP-IP:8000/player4</span></td><td class="blue">BLUE team</td></tr>
+  </table>
+  Faster: open <span class="mono">http://LAPTOP-IP:8000</span> on one phone and scan the <b>QR codes</b> on the dashboard.
+</div></div>
+<div class="step blue"><div class="n">3</div><div class="b">
+  On each phone: rotate to <b>landscape</b>, tap <b>fullscreen</b>.
+  The dashboard should show all four cards as <b>● connected</b>.
+</div></div>
+<div class="tip"><b>Customize buttons:</b> press ✏️ on a phone to open the layout editor — drag, resize, save. Layouts auto-save per phone.</div>
+
+<h3>The controller</h3>
+<table>
+  <tr><th>Control</th><th>In menus</th><th>In fight</th></tr>
+  <tr><td><b>D-PAD / NUB</b></td><td>move the cursor</td><td>move / crouch / jump</td></tr>
+  <tr><td><b>A</b></td><td>confirm / OK</td><td>left punch</td></tr>
+  <tr><td><b>B</b></td><td>back / cancel</td><td>right punch</td></tr>
+  <tr><td><b>X</b></td><td>—</td><td>left kick</td></tr>
+  <tr><td><b>Y</b></td><td>—</td><td>right kick</td></tr>
+  <tr><td><b>LB / RB</b></td><td>—</td><td><b>TAG</b> — bring your partner in!</td></tr>
+  <tr><td><b>START</b></td><td>join / pause</td><td>pause</td></tr>
+  <tr><td><b>BACK</b></td><td>select / random team</td><td>—</td></tr>
+</table>
+<div class="warn"><b>Golden rule — who is Player 1?</b> Controllers are claimed in <b>first-press order</b>. Whoever presses a button first becomes Player 1, the next press Player 2, and so on. So <b>P1 presses START first</b> at the title screen, then the others in order.</div>
+
+<div class="pb"></div>
+<h2><span class="num">7</span>How to play — the 4-player 2v2 (PAIR PLAY)</h2>
+
+<div class="step"><div class="n">1</div><div class="b">
+  On the dashboard press <b>Start game</b> — Tekken opens on the TV (HDMI).
+</div></div>
+<div class="step"><div class="n">2</div><div class="b">
+  <b>Title screen:</b> Player 1 presses <b>START</b> on their phone. If an auto-save notice appears, P1 presses <b>A</b>.
+</div></div>
+<img src="images/main_menu.png"><div class="caption">The main menu</div>
+
+<div class="step"><div class="n">3</div><div class="b">
+  Select <b>OFFLINE MODE</b> (press <b>A</b>), move down to the last row, <b>PAIR PLAY</b>, press <b>A</b>.
+</div></div>
+<img src="images/offline_menu.png"><div class="caption">OFFLINE MODE → PAIR PLAY (last row)</div>
+
+<div class="step"><div class="n">4</div><div class="b">
+  <b>The stones screen.</b> Four stones: two <span class="red">red</span> (left), two <span class="blue">blue</span> (right).
+  Each player joins <b>one at a time, in player order</b>:
+</div></div>
+<table>
+  <tr><th>Order</th><th>Each player does</th></tr>
+  <tr><td><b>P1</b></td><td>Press <span class="kbd">START</span> → move <span class="kbd">LEFT/RIGHT</span> onto a red stone → <span class="kbd">A</span> → a dialog appears (<i>“Exiting player select. Continue anyway?”</i>) — press <span class="kbd">A</span> (OK) to advance. This dialog is normal!</td></tr>
+  <tr><td><b>P2</b></td><td>Press <span class="kbd">START</span> → the other red stone → <span class="kbd">A</span> → <span class="kbd">A</span> on the dialog</td></tr>
+  <tr><td><b>P3</b></td><td>Press <span class="kbd">START</span> → a blue stone → <span class="kbd">A</span> → <span class="kbd">A</span> on the dialog</td></tr>
+  <tr><td><b>P4</b></td><td>Press <span class="kbd">START</span> → the last blue stone → <span class="kbd">A</span> → <span class="kbd">A</span> on the dialog</td></tr>
+</table>
+<img src="images/pair_play_four_seated.png"><div class="caption">All four seated — RED team: P1 + P2 · BLUE team: P3 + P4</div>
+
+<div class="step"><div class="n">5</div><div class="b">
+  <b>Character select:</b> press <b>A</b> to leave the stones. One picker per side drives the selection: <b>P2 picks for red, P3 picks for blue</b> (portraits update live). Confirm both fighters — the match begins!
+</div></div>
+<img src="images/pair_play_select.png"><div class="caption">PAIR PLAY character select</div>
+
+<div class="step"><div class="n">6</div><div class="b">
+  <b>Fight!</b> The active fighter battles while the partner waits. Press <b>LB or RB (TAG)</b> to swap your teammate in — tag combos, walls, rage: everything like the console version.
+</div></div>
+<img src="images/fight_action.png"><div class="caption">Live 2v2 tag action</div>
+
+<div class="step"><div class="n">7</div><div class="b">
+  <b>After a match:</b> follow the on-screen prompts (A = continue / rematch). To leave PAIR PLAY: a picker pad presses <b>B</b>, then <b>A</b> to confirm.
+</div></div>
+
+<h2><span class="num">8</span>Other game modes</h2>
+<h3>VS BATTLE — classic 1v1</h3>
+<ol>
+  <li>Main menu → <b>OFFLINE MODE</b> → <b>VS BATTLE</b></li>
+  <li>P1 and P2 each pick a character → fight</li>
+</ol>
+<h3>TEAM BATTLE — up to 8 characters per team</h3>
+<ol>
+  <li>Main menu → <b>OFFLINE MODE</b> → <b>TEAM BATTLE</b></li>
+  <li>P1 presses <b>START</b> and sits on red (one human per side here — the other side is CPU)</li>
+  <li>On the team-size row press <span class="kbd">LEFT/RIGHT</span> to set <b>1–8 characters per team</b>, then <b>A</b></li>
+  <li>Pick your team and fight the elimination. <b>BACK = random team</b> for instant fun.</li>
+</ol>
+<img src="images/team_battle_select.png"><div class="caption">TEAM BATTLE — “2 PLAYERS ON TEAM” set with LEFT/RIGHT</div>
+<h3>Single-player</h3>
+<p>ARCADE, GHOST, TIME ATTACK, SURVIVAL, PRACTICE, FIGHT LAB — all fully playable with P1's phone.</p>
+
+<h2><span class="num">9</span>Troubleshooting</h2>
+<table>
+  <tr><th>Problem</th><th>Fix</th></tr>
+  <tr><td>Browser blocks the .bat or ttt2_setup</td><td>Choose <b>Keep</b>, or <b>More info → Run anyway</b> — they are safe</td></tr>
+  <tr><td>Phone page won't load</td><td>Run <span class="path">start_server.bat</span>; check laptop + phones on the same Wi-Fi</td></tr>
+  <tr><td>Dashboard says “LICENSE REQUIRED”</td><td>Send the laptop fingerprint to your seller, enter the key you receive</td></tr>
+  <tr><td>“denied: slot in use” on a phone</td><td>Another tab owns that slot — close it, reopen the link</td></tr>
+  <tr><td>A button stuck in-game</td><td>The phone dropped while held — reopen the player link; the server auto-releases</td></tr>
+  <tr><td>P2/P3/P4 don't respond in menus</td><td>Pads claim in first-press order — P1 presses START first at the title</td></tr>
+  <tr><td>The keyboard types into the game</td><td>The laptop keyboard is merged into Player 1 — don't type while playing</td></tr>
+  <tr><td>INSTALL.bat fails at libraries</td><td>Check internet once, rerun INSTALL.bat</td></tr>
+  <tr><td>Game doesn't start from the dashboard</td><td>Run INSTALL.bat again and re-drag the game's .exe (it remembers the new path)</td></tr>
+  <tr><td>ttt2_setup says the ISO/TU3 is wrong</td><td>Use the exact disc image <i>Tekken Tag Tournament 2 (USA, Europe)</i> + its Title Update 3</td></tr>
+</table>
+
+<h2>Have fun — and tag often! 🥊</h2>
+
+</body>
+</html>

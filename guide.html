@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TTT2 Local Lounge — The Complete Guide</title>
+<style>
+  @font-face { font-family: "Manrope"; src: url("console/static/fonts/f12.woff2") format("woff2"); font-weight: 400 800; }
+  @font-face { font-family: "Geist Mono"; src: url("console/static/fonts/f6.woff2") format("woff2"); font-weight: 400 700; }
+  @page { size: A4; margin: 16mm 15mm 18mm; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: "Manrope", "Segoe UI", sans-serif; color: #1a1a1a; font-size: 10.5pt; line-height: 1.55; margin: 0; }
+  h1, h2, h3 { line-height: 1.2; }
+  .cover { page-break-after: always; text-align: center; padding-top: 60mm; }
+  .cover h1 { font-size: 30pt; font-weight: 800; margin: 0 0 8pt; }
+  .cover .tag { font-size: 14pt; color: #555; margin-bottom: 30pt; }
+  .cover .badge { display: inline-block; background: #181818; color: #fff; border-radius: 999px; padding: 6pt 16pt; font-size: 10pt; font-weight: 700; margin: 3pt; }
+  .cover .note { margin-top: 26mm; color: #777; font-size: 9.5pt; }
+  h2 { font-size: 17pt; font-weight: 800; border-bottom: 3pt solid #181818; padding-bottom: 5pt; margin: 26pt 0 12pt; page-break-after: avoid; }
+  h3 { font-size: 12.5pt; font-weight: 800; margin: 16pt 0 7pt; page-break-after: avoid; }
+  h2 .num { display: inline-block; background: #181818; color: #fff; border-radius: 7pt; padding: 1pt 9pt; margin-right: 7pt; }
+  .step { display: flex; margin: 10pt 0; page-break-inside: avoid; }
+  .step .n { flex: none; width: 22pt; height: 22pt; background: #FF4D5A; color: #fff; border-radius: 50%; text-align: center; font-weight: 800; font-size: 11pt; line-height: 22pt; margin-right: 9pt; margin-top: 1pt; }
+  .step.blue .n { background: #4DA3FF; }
+  .step .b { flex: 1; }
+  .step .b b.t { display: block; font-size: 11pt; margin-bottom: 2pt; }
+  code, .mono { font-family: "Geist Mono", monospace; font-size: 9pt; background: #f1f1f1; border-radius: 3pt; padding: 1pt 4pt; }
+  .path { font-family: "Geist Mono", monospace; font-size: 8.5pt; }
+  .tip { background: #FFF7E6; border-radius: 8pt; padding: 8pt 12pt; margin: 9pt 0; page-break-inside: avoid; }
+  .warn { background: #FDECEA; border-radius: 8pt; padding: 8pt 12pt; margin: 9pt 0; page-break-inside: avoid; }
+  .ok { background: #EAF7EE; border-radius: 8pt; padding: 8pt 12pt; margin: 9pt 0; page-break-inside: avoid; }
+  table { width: 100%; border-collapse: collapse; margin: 9pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  th { background: #181818; color: #fff; text-align: left; padding: 5pt 8pt; font-weight: 700; }
+  td { border-bottom: 1pt solid #ddd; padding: 5pt 8pt; vertical-align: top; }
+  tr { page-break-inside: avoid; }
+  img { max-width: 88%; border: 1pt solid #ccc; border-radius: 6pt; margin: 6pt auto; display: block; page-break-inside: avoid; }
+  .caption { text-align: center; color: #777; font-size: 8.5pt; margin: 2pt 0 10pt; }
+  .pb { page-break-before: always; }
+  .red { color: #c22335; font-weight: 700; }
+  .blue { color: #1a6fd4; font-weight: 700; }
+  .kbd { font-family: "Geist Mono", monospace; font-size: 8.5pt; background: #181818; color: #fff; border-radius: 3pt; padding: 1.5pt 6pt; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>TTT2 Local Lounge</h1>
+  <div class="tag">The Complete Guide — Install &amp; Play</div>
+  <div>
+    <span class="badge">4 phones = 4 controllers</span>
+    <span class="badge">1 laptop</span>
+    <span class="badge">TV via HDMI</span>
+  </div>
+  <div>
+    <span class="badge">Wi-Fi only · no internet needed</span>
+    <span class="badge">2v2 tag team</span>
+  </div>
+  <div class="note">Tekken Tag Tournament 2 · Version 1.0</div>
+</div>
+
+<h2>What you need</h2>
+<table>
+  <tr><th>Item</th><th>Details</th></tr>
+  <tr><td>Windows gaming laptop</td><td>Windows 10 or 11, connected to your TV with an HDMI cable</td></tr>
+  <tr><td>Up to 4 smartphones</td><td>Any Android or iPhone — they become the controllers</td></tr>
+  <tr><td>Home Wi-Fi</td><td>Laptop and phones on the <b>same network</b>. No internet needed to play.</td></tr>
+  <tr><td>Your Tekken Tag Tournament 2 PC game</td><td>Your own legal copy — you will tell the system where its .exe is during setup</td></tr>
+  <tr><td>Your license key</td><td>One key from the seller. It works on <b>this laptop only</b>, forever.</td></tr>
+</table>
+
+<div class="pb"></div>
+<h2><span class="num">A</span>Installation — step by step</h2>
+
+<h3>Step 1 — Run the installer you received</h3>
+<div class="step"><div class="n">1</div><div class="b">
+  <b class="t">Double-click <span class="path">TTT2_Local_Lounge_SETUP.bat</span></b>
+  (it may be on your Desktop or in Downloads).
+  <ul>
+    <li>Your browser may warn about <code>.bat</code> files — this is normal. Choose <b>Keep / Run anyway</b>.</li>
+    <li>Windows SmartScreen may appear — click <b>More info → Run anyway</b>.</li>
+  </ul>
+</div></div>
+<div class="step"><div class="n">2</div><div class="b">
+  <b class="t">Watch it extract</b> — a black window opens, extracts everything into a
+  <b>TTT2_Local_Lounge</b> folder next to itself, then <b>the installer deletes itself</b>.
+  That is normal — the folder is now your copy.
+</div></div>
+<div class="ok"><b>Result:</b> a folder like <span class="path">C:\Users\you\Downloads\TTT2_Local_Lounge\</span> containing <span class="path">console\</span> and <span class="path">START_HERE.txt</span>.</div>
+
+<h3>Step 2 — Install Python (once)</h3>
+<div class="step"><div class="n">3</div><div class="b">
+  <b class="t">Go to <code>python.org/downloads</code> and download Python.</b>
+  <ul>
+    <li>Run the installer.</li>
+    <li><span class="red">CRITICAL:</span> tick <b>“Add python.exe to PATH”</b> on the first screen — the system cannot work without it.</li>
+    <li>Click <b>Install Now</b>, wait for it to finish.</li>
+  </ul>
+</div></div>
+
+<h3>Step 3 — Run the automatic setup (once)</h3>
+<div class="step"><div class="n">4</div><div class="b">
+  <b class="t">Open the <span class="path">console\</span> folder and double-click <span class="path">INSTALL.bat</span></b>
+  — it does everything for you in 5 steps:
+</div></div>
+<table>
+  <tr><th>Setup step</th><th>What happens / what you do</th></tr>
+  <tr><td>1/5 Python</td><td>Detects Python. If missing, it opens the download page — install with “Add to PATH”, then run INSTALL.bat again.</td></tr>
+  <tr><td>2/5 Libraries</td><td>Downloads the server libraries automatically (needs internet for this one time).</td></tr>
+  <tr><td>3/5 Controller driver</td><td>Downloads and installs the <b>ViGEm Bus driver</b>. Windows will ask for permission — click <b>Yes</b>.</td></tr>
+  <tr><td>4/5 Game path</td><td>It asks: <i>“DRAG your Tekken Tag Tournament 2 .exe into this window”</i> — drag the game's .exe from its folder into the black window and press <b>Enter</b>.</td></tr>
+  <tr><td>5/5 Verification</td><td>Checks everything and prints <b>SETUP COMPLETE!</b></td></tr>
+</table>
+<div class="tip"><b>Tip:</b> If anything ever breaks later, run <span class="path">INSTALL.bat</span> again — it repairs libraries, driver and game path in one go.</div>
+
+<h3>Step 4 — Activate your license (once, forever)</h3>
+<div class="step"><div class="n">5</div><div class="b">
+  Double-click <span class="path">console\start_server.bat</span>.
+  The dashboard opens in your browser and shows a <b>lock screen</b>.
+</div></div>
+<div class="step"><div class="n">6</div><div class="b">
+  The lock screen shows a <b>“laptop fingerprint”</b> — a code like
+  <span class="mono">9F3E-E2FB-EA8F-6C53</span>. <b>Send that code to your seller</b> (a WhatsApp photo is fine).
+</div></div>
+<div class="step"><div class="n">7</div><div class="b">
+  Your seller sends you back a key like <span class="mono">TTT2-XXXXXXXX-XXXXXXXX</span>.
+  Type it into the <b>LICENSE KEY</b> box and press <b>Activate</b>.
+</div></div>
+<div class="ok"><b>Done!</b> The full dashboard unlocks. This key works on <b>this laptop only</b> — you will never need it again.</div>
+<div class="warn"><b>Keep the server window open</b> (the black window titled “TTT2 Local Console Server”) while you play. Closing it turns off the controllers.</div>
+
+<div class="pb"></div>
+<h2><span class="num">B</span>Connect the phones</h2>
+
+<div class="step blue"><div class="n">1</div><div class="b">
+  Make sure every phone is on the <b>same Wi-Fi</b> as the laptop.
+</div></div>
+<div class="step blue"><div class="n">2</div><div class="b">
+  On each phone's browser, open its player link. The exact addresses are printed on the dashboard and in the server window:
+  <table>
+    <tr><th>Phone</th><th>Open</th><th>Plays</th></tr>
+    <tr><td>Phone 1</td><td><span class="mono">http://LAPTOP-IP:8000/player1</span></td><td class="red">RED team</td></tr>
+    <tr><td>Phone 2</td><td><span class="mono">http://LAPTOP-IP:8000/player2</span></td><td class="red">RED team</td></tr>
+    <tr><td>Phone 3</td><td><span class="mono">http://LAPTOP-IP:8000/player3</span></td><td class="blue">BLUE team</td></tr>
+    <tr><td>Phone 4</td><td><span class="mono">http://LAPTOP-IP:8000/player4</span></td><td class="blue">BLUE team</td></tr>
+  </table>
+  Faster way: open <span class="mono">http://LAPTOP-IP:8000</span> on one phone and scan the <b>QR codes</b> on the dashboard — each QR opens that player's link.
+</div></div>
+<div class="step blue"><div class="n">3</div><div class="b">
+  On each phone: rotate to <b>landscape</b> and tap the <b>fullscreen</b> button.
+  <br>Check the dashboard — every card should now show <b>● connected</b>.
+</div></div>
+<div class="tip"><b>Button layout:</b> press the ✏️ button on a phone to open the layout editor — drag buttons, resize, save. Layouts auto-save per phone.</div>
+<div class="tip"><b>If a phone disconnects:</b> just reopen the same link — it reclaims its slot. The server releases stuck buttons automatically when a phone drops.</div>
+
+<h3>The controller</h3>
+<table>
+  <tr><th>Control</th><th>In menus</th><th>In fight</th></tr>
+  <tr><td><b>D-PAD / NUB</b></td><td>move the cursor</td><td>move / crouch / jump</td></tr>
+  <tr><td><b>A</b></td><td>confirm / OK</td><td>left punch</td></tr>
+  <tr><td><b>B</b></td><td>back / cancel</td><td>right punch</td></tr>
+  <tr><td><b>X</b></td><td>—</td><td>left kick</td></tr>
+  <tr><td><b>Y</b></td><td>—</td><td>right kick</td></tr>
+  <tr><td><b>LB / RB</b></td><td>—</td><td><b>TAG</b> — bring your partner in!</td></tr>
+  <tr><td><b>START</b></td><td>join / pause</td><td>pause</td></tr>
+  <tr><td><b>BACK</b></td><td>select / random team</td><td>—</td></tr>
+</table>
+<div class="warn"><b>Golden rule — who is Player 1?</b> Controllers are claimed in <b>first-press order</b>. Whoever presses a button first in the game becomes Player 1, the next press becomes Player 2, etc. So <b>P1 must press START first</b> at the title screen, then the others in order.</div>
+
+<div class="pb"></div>
+<h2><span class="num">C</span>How to play — the 4-player 2v2 (PAIR PLAY)</h2>
+
+<div class="step"><div class="n">1</div><div class="b">
+  On the dashboard press <b>Start game</b> — Tekken opens on the TV (HDMI).
+</div></div>
+<div class="step"><div class="n">2</div><div class="b">
+  <b>Title screen:</b> Player 1 presses <b>START</b> on their phone. If an auto-save notice appears, P1 presses <b>A</b>.
+</div></div>
+<img src="images/main_menu.png"><div class="caption">The main menu</div>
+
+<div class="step"><div class="n">3</div><div class="b">
+  Select <b>OFFLINE MODE</b> (press <b>A</b>), then move down to the last row, <b>PAIR PLAY</b>, and press <b>A</b>.
+</div></div>
+<img src="images/offline_menu.png"><div class="caption">OFFLINE MODE → PAIR PLAY (last row)</div>
+
+<div class="step"><div class="n">4</div><div class="b">
+  <b>The stones screen.</b> Four stones: two <span class="red">red</span> (left), two <span class="blue">blue</span> (right).
+  Every player now joins <b>one at a time, in player order</b>:
+</div></div>
+<table>
+  <tr><th>Order</th><th>Each player does</th></tr>
+  <tr><td><b>P1</b></td><td>Press <span class="kbd">START</span> → move <span class="kbd">LEFT/RIGHT</span> onto a red stone → press <span class="kbd">A</span> → a dialog appears (<i>“Exiting player select. Continue anyway?”</i>) — press <span class="kbd">A</span> (OK) to advance. This dialog is normal!</td></tr>
+  <tr><td><b>P2</b></td><td>Press <span class="kbd">START</span> → move to the other red stone → <span class="kbd">A</span> → <span class="kbd">A</span> on the dialog</td></tr>
+  <tr><td><b>P3</b></td><td>Press <span class="kbd">START</span> → move to a blue stone → <span class="kbd">A</span> → <span class="kbd">A</span> on the dialog</td></tr>
+  <tr><td><b>P4</b></td><td>Press <span class="kbd">START</span> → move to the last blue stone → <span class="kbd">A</span> → <span class="kbd">A</span> on the dialog</td></tr>
+</table>
+<img src="images/pair_play_four_seated.png"><div class="caption">All four seated — RED team: P1 + P2 · BLUE team: P3 + P4</div>
+
+<div class="step"><div class="n">5</div><div class="b">
+  <b>Character select:</b> press <b>A</b> to leave the stones.
+  One picker per side drives the selection: <b>P2 picks for the red side, P3 for the blue side</b> (portraits update live).
+  Confirm both fighters — the match begins!
+</div></div>
+<img src="images/pair_play_select.png"><div class="caption">PAIR PLAY character select</div>
+
+<div class="step"><div class="n">6</div><div class="b">
+  <b>Fight!</b> The active fighter battles while the partner waits.
+  Press <b>LB or RB (TAG)</b> to swap your teammate in — tag combos, walls, rage: everything works like the console version.
+</div></div>
+<img src="images/fight_action.png"><div class="caption">Live 2v2 tag action</div>
+
+<div class="step"><div class="n">7</div><div class="b">
+  <b>After a match:</b> follow the on-screen prompts (A = continue / rematch).
+  To leave PAIR PLAY: a picker pad presses <b>B</b>, then <b>A</b> to confirm — back to the main menu.
+</div></div>
+
+<div class="pb"></div>
+<h2><span class="num">D</span>Other game modes</h2>
+
+<h3>VS BATTLE — classic 1v1</h3>
+<ol>
+  <li>Main menu → <b>OFFLINE MODE</b> → <b>VS BATTLE</b></li>
+  <li>P1 and P2 each pick a character</li>
+  <li>Fight — the original two-player mode</li>
+</ol>
+
+<h3>TEAM BATTLE — up to 8 characters per team</h3>
+<ol>
+  <li>Main menu → <b>OFFLINE MODE</b> → <b>TEAM BATTLE</b></li>
+  <li>P1 presses <b>START</b> and sits on red (one human per side here — the other side is CPU)</li>
+  <li>On the team-size row, press <span class="kbd">LEFT/RIGHT</span> to set <b>1–8 characters per team</b>, then <b>A</b></li>
+  <li>Pick your team and fight the elimination</li>
+  <li><b>BACK = random team</b> — instant fun</li>
+</ol>
+<img src="images/team_battle_select.png"><div class="caption">TEAM BATTLE — “2 PLAYERS ON TEAM” set with LEFT/RIGHT</div>
+
+<h3>Single-player</h3>
+<p>ARCADE, GHOST, TIME ATTACK, SURVIVAL, PRACTICE, FIGHT LAB — all fully playable with P1's phone.</p>
+
+<h2><span class="num">E</span>Troubleshooting</h2>
+<table>
+  <tr><th>Problem</th><th>Fix</th></tr>
+  <tr><td>Phone page won't load</td><td>Server not running — run <span class="path">start_server.bat</span>; check laptop + phones are on the same Wi-Fi</td></tr>
+  <tr><td>Dashboard says “LICENSE REQUIRED”</td><td>Send the laptop fingerprint to your seller, enter the key you receive</td></tr>
+  <tr><td>“denied: slot in use” on a phone</td><td>Another tab owns that slot — close it and reopen the link</td></tr>
+  <tr><td>A button stuck in-game</td><td>The phone dropped while held — reopen the player link; the server auto-releases</td></tr>
+  <tr><td>P2/P3/P4 don't respond in menus</td><td>Pads claim in first-press order — P1 must press START first at the title screen</td></tr>
+  <tr><td>The keyboard types into the game</td><td>The laptop keyboard is merged into Player 1 — don't type while playing</td></tr>
+  <tr><td>INSTALL.bat fails at libraries</td><td>Check internet once, then rerun INSTALL.bat</td></tr>
+  <tr><td>Game doesn't start</td><td>Check the game path in <span class="path">console\settings.json</span> — rerun INSTALL.bat step 4 to set it again</td></tr>
+</table>
+
+<h2>Have fun — and tag often! 🥊</h2>
+
+</body>
+</html>
